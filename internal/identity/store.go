@@ -73,16 +73,12 @@ func (s *Store) LoadIdentity() (*IdentityState, error) {
 // CreateFresh creates a new identity and durably commits it. It fails with
 // ErrIdentityExists if a durable identity already exists: identity creation
 // is create-once and never silently replaces an existing Body. The commit is
-// atomic: a temp file in the same directory is fsynced and renamed over the
-// target, so a crash never leaves a half-written identity file.
+// atomic: we open the identity file with O_CREATE|O_EXCL, so exactly one
+// goroutine can win the race to create the file.
 func (s *Store) CreateFresh(name string, meta BodyMetadata) (*IdentityState, error) {
 	if err := s.EnsureDir(); err != nil {
 		return nil, err
 	}
-	if s.HasIdentity() {
-		return nil, ErrIdentityExists
-	}
-
 	st, err := NewIdentityState(name, meta)
 	if err != nil {
 		return nil, err
@@ -92,48 +88,31 @@ func (s *Store) CreateFresh(name string, meta BodyMetadata) (*IdentityState, err
 		return nil, err
 	}
 
-	if err := writeIdentityAtomic(s.identityPath(), []byte(raw)); err != nil {
+	f, err := os.OpenFile(s.identityPath(), os.O_CREATE|os.O_EXCL|os.O_WRONLY, identityMode)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return nil, ErrIdentityExists
+		}
+		return nil, fmt.Errorf("identity: open %s: %w", s.identityPath(), err)
+	}
+	defer func() {
+		// If we succeed, we will keep the file. On any error before success,
+		// we remove it to avoid leaving a partial file.
+		if err != nil {
+			_ = os.Remove(s.identityPath())
+		}
+	}()
+
+	if _, err := f.Write([]byte(raw)); err != nil {
+		return nil, err
+	}
+	if err := f.Sync(); err != nil {
+		return nil, err
+	}
+	if err := f.Close(); err != nil {
 		return nil, err
 	}
 	return st, nil
-}
-
-// writeIdentityAtomic writes data to path via a same-directory temp file and
-// an atomic rename, fsyncing both file and directory. It removes the temp
-// file on any error.
-func writeIdentityAtomic(path string, data []byte) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, identityFileName+identityTmpSuffix)
-	if err != nil {
-		return fmt.Errorf("identity: create temp in %s: %w", dir, err)
-	}
-	tmpName := tmp.Name()
-	defer func() {
-		tmp.Close()
-		os.Remove(tmpName) // best-effort; harmless if already gone
-	}()
-
-	if modeErr := os.Chmod(tmpName, identityMode); modeErr != nil {
-		return fmt.Errorf("identity: chmod temp: %w", modeErr)
-	}
-	if _, err := tmp.Write(data); err != nil {
-		return fmt.Errorf("identity: write temp: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		return fmt.Errorf("identity: sync temp: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("identity: close temp: %w", err)
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("identity: commit rename: %w", err)
-	}
-	// Best-effort directory fsync for durable rename.
-	if d, err := os.Open(dir); err == nil {
-		_ = d.Sync()
-		d.Close()
-	}
-	return nil
 }
 
 // StateError wraps store failures with the offending operation.
