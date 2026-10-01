@@ -339,3 +339,95 @@ func TestHostPort(t *testing.T) {
 		})
 	}
 }
+
+// TestResolveDirectEndpoint covers endpoint selection from the persisted Core
+// endpoint strings that the connect path reads. It must resolve the M2 URL form
+// persisted by real pairing, prefer a canonical structured direct descriptor
+// when one is present, and fail closed when no unambiguous direct WG UDP
+// endpoint exists (relay-only or port-less state).
+func TestResolveDirectEndpoint(t *testing.T) {
+	structEP := `{"type":"direct","host":"203.0.113.50","port":51820,"transport":"udp"}`
+	relayEP := `{"type":"relay","relay_url":"https://relay.example.net","route_id":"opaque-route-id"}`
+	badUDP := `{"type":"direct","host":"203.0.113.50","port":70000,"transport":"udp"}`
+
+	tests := []struct {
+		name      string
+		endpoints []string
+		wantHost  string
+		wantPort  int
+		wantErr   bool
+	}{
+		{
+			name:      "M2 URL form resolves to a direct endpoint",
+			endpoints: []string{"https://core.example.com:51820"},
+			wantHost:  "core.example.com",
+			wantPort:  51820,
+		},
+		{
+			name:      "structured direct descriptor works",
+			endpoints: []string{structEP},
+			wantHost:  "203.0.113.50",
+			wantPort:  51820,
+		},
+		{
+			name:      "structured descriptor preferred over M2 URL",
+			endpoints: []string{"https://legacy.example.com:1111", structEP},
+			wantHost:  "203.0.113.50",
+			wantPort:  51820,
+		},
+		{
+			name:      "IPv6 M2 URL form resolves",
+			endpoints: []string{"http://[fd00::1]:51820"},
+			wantHost:  "fd00::1",
+			wantPort:  51820,
+		},
+		{
+			name:      "port-less bootstrap URL fails closed",
+			endpoints: []string{"https://core.example.com/"},
+			wantErr:   true,
+		},
+		{
+			name:      "relay descriptor fails closed",
+			endpoints: []string{relayEP},
+			wantErr:   true,
+		},
+		{
+			name:      "relay:// URL fails closed (not reinterpreted as direct)",
+			endpoints: []string{"relay://relay.example.net:9999"},
+			wantErr:   true,
+		},
+		{
+			name:      "non-direct transport descriptor fails closed",
+			endpoints: []string{badUDP},
+			wantErr:   true,
+		},
+		{
+			name:      "empty endpoint list fails closed",
+			endpoints: []string{},
+			wantErr:   true,
+		},
+		{
+			name:      "malformed endpoint string fails closed",
+			endpoints: []string{"not a url or json"},
+			wantErr:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ResolveDirectEndpoint(tt.endpoints)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("ResolveDirectEndpoint(%v) succeeded = %+v, want error (fail closed)", tt.endpoints, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ResolveDirectEndpoint(%v) unexpected error: %v", tt.endpoints, err)
+			}
+			if got.Host != tt.wantHost || got.Port != tt.wantPort {
+				t.Errorf("ResolveDirectEndpoint(%v) = %s:%d, want %s:%d", tt.endpoints, got.Host, got.Port, tt.wantHost, tt.wantPort)
+			}
+		})
+	}
+}

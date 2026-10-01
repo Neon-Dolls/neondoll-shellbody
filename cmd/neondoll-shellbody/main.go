@@ -177,22 +177,13 @@ func connect(store *body.Store) error {
 		return errors.New("membership corrupt: missing Core endpoint(s)")
 	}
 
-	// Parse Core endpoints and select the first valid direct endpoint
-	var coreEP dollnetwork.DirectEndpoint
-	found := false
-	for _, epStr := range mem.CoreEndpoints {
-		ep, err := dollnetwork.ParseDirectEndpoint(epStr)
-		if err != nil {
-			continue // skip invalid endpoints
-		}
-		if ep.Type == "direct" && ep.Transport == "udp" {
-			coreEP = *ep
-			found = true
-			break
-		}
-	}
-	if !found {
-		return errors.New("no valid direct UDP endpoint found in membership")
+	// Resolve an unambiguous direct WireGuard UDP endpoint for Core from the
+	// persisted state. This supports both the canonical structured descriptor
+	// (M3) and the M2 URL form actually persisted by real pairing; it fails
+	// closed if no unambiguous direct endpoint is present.
+	coreEP, err := dollnetwork.ResolveDirectEndpoint(mem.CoreEndpoints)
+	if err != nil {
+		return err
 	}
 
 	// Decode the Body's private key (never exposed in logs)
@@ -230,16 +221,24 @@ func connect(store *body.Store) error {
 	}
 	defer tun.Stop() // Ensure we stop it
 
+	// Select Core IPv6 from persisted membership and verify connectivity
+	coreIPv6 := mem.SelectCoreIPv6()
+	if coreIPv6 == "" {
+		return errors.New("no valid Core IPv6 address found in membership")
+	}
+
 	// Verify connectivity by pinging the Core's IPv6 over the WG interface
-	// Note: We don't have the Core's IPv6 from M2 state, so we can't do full verification yet
-	// This would require extending the membership to include Core's assigned IPv6
+	if err := tun.Ping6Core(coreIPv6, 1, 5*time.Second); err != nil {
+		return fmt.Errorf("failed to reach Core over WG: %w", err)
+	}
+
 	fmt.Printf("WireGuard tunnel established successfully:\n")
 	fmt.Printf("  Interface: wg0\n")
 	fmt.Printf("  Body IPv6: %s\n", mem.BodyIPv6)
+	fmt.Printf("  Core IPv6: %s\n", coreIPv6)
 	fmt.Printf("  Core peer ID: %s\n", mem.CorePeerID)
 	fmt.Printf("  Core endpoint: %s:%d\n", coreEP.Host, coreEP.Port)
 	fmt.Printf("  Network ID: %s\n", mem.NetworkID)
-	fmt.Printf("\nNOTE: Full connectivity verification requires Core's assigned IPv6 in membership state\n")
 
 	return nil
 }

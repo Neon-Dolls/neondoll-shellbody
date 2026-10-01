@@ -132,9 +132,16 @@ func FromBootstrapURL(rawURL string) (*DirectEndpoint, error) {
 		return nil, fmt.Errorf("dollnetwork: invalid bootstrap URL %q: %w", rawURL, err)
 	}
 	scheme := u.Scheme
+	// Only the direct transports (http/https) can yield a direct WG endpoint.
+	// A relay:// URL advertises transit via a relay, not a direct UDP endpoint;
+	// silently reinterpreting it as direct would fabricate a route. We reject
+	// it explicitly so callers can report the limitation instead of guessing.
+	if scheme != "http" && scheme != "https" {
+		return nil, &ErrUnsupportedEndpoint{Type: fmt.Sprintf("%s:not-direct-transport", schemeOr(scheme))}
+	}
 	host := u.Hostname()
 	if host == "" {
-		return nil, &ErrUnsupportedEndpoint{Type: "(no host)"}
+		return nil, &ErrUnsupportedEndpoint{Type: "http:no-host"}
 	}
 	portStr := u.Port()
 	if portStr == "" {
@@ -157,4 +164,45 @@ func FromBootstrapURL(rawURL string) (*DirectEndpoint, error) {
 		return nil, err
 	}
 	return ep, nil
+}
+
+// schemeOr returns the scheme, or "(empty)" when it is missing (unreachable
+// guard against a URL parse that yields an empty scheme).
+func schemeOr(s string) string {
+	if s == "" {
+		return "(empty)"
+	}
+	return s
+}
+
+// ResolveDirectEndpoint picks an unambiguous direct WireGuard UDP endpoint from
+// the persisted Core endpoint strings carried by Shell Body membership. M3
+// prefers a canonical structured descriptor (JSON DirectEndpoint with a direct
+// UDP transport); when only M2-form bootstrap URLs were persisted it falls back
+// to FromBootstrapURL — the explicit migration helper — so a Body paired
+// through the real M2 flow can resolve a genuine direct endpoint. Relay-only or
+// otherwise ambiguous state (port-less URLs, non-direct transports, malformed
+// descriptors) fails closed with a descriptive error so callers never guess at
+// a WireGuard UDP endpoint.
+func ResolveDirectEndpoint(coreEndpoints []string) (*DirectEndpoint, error) {
+	// Preferred pass: canonical structured descriptors.
+	for _, s := range coreEndpoints {
+		ep, err := ParseDirectEndpoint(s)
+		if err == nil {
+			if verr := ep.ValidDirect(); verr == nil {
+				return ep, nil
+			}
+		}
+	}
+	// Migration pass: M2 URL form, resolved only through the sanctioned helper.
+	for _, s := range coreEndpoints {
+		ep, err := FromBootstrapURL(s)
+		if err == nil && ep.ValidDirect() == nil {
+			return ep, nil
+		}
+	}
+	return nil, errors.New(
+		"no unambiguous direct WireGuard UDP endpoint in persisted Core endpoints: " +
+			"the current public protocol persists pairing/bootstrap URLs; a Core that advertises " +
+			"only relay or port-less endpoints cannot yield a direct WG UDP endpoint")
 }

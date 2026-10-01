@@ -3,8 +3,10 @@ package tunnel
 import (
 	"bytes"
 	"encoding/base64"
+	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestNewWireGuardTunnelValid asserts that a valid configuration produces a
@@ -182,5 +184,42 @@ func TestEncodeKeyLength(t *testing.T) {
 	}
 	if strings.TrimRight(got, "=") == got {
 		t.Errorf("expected base64 padding on 32-byte key, got %q", got)
+	}
+}
+
+// TestPing6CoreFailClosed proves Ping6Core returns an error (never a silent
+// success) when the private path to the Core cannot be exercised. This is the
+// guardrail behind the connect() rule "do not print success until the proof
+// succeeds": any failure to reach the peer must surface as an error so the
+// caller fails rather than reporting a false positive.
+//
+// It uses a deliberately non-existent interface so the ICMPv6 bind fails
+// regardless of privileges, and skips when ping6 is unavailable. It does not
+// require root.
+func TestPing6CoreFailClosed(t *testing.T) {
+	if _, err := exec.LookPath("ping6"); err != nil {
+		t.Skip("ping6 not available")
+	}
+	// A stream-safe unique interface name that is guaranteed not to exist.
+	seq := strings.ReplaceAll(t.Name(), "/", "-")
+	iface := "wg-nope-" + seq[len(seq)-12:]
+
+	tun, err := NewWireGuardTunnel(
+		iface,
+		key32(0xa1),
+		key32(0xb2),
+		"fd00::1",
+		"203.0.113.9",
+		51820,
+		"",
+	)
+	if err != nil {
+		t.Fatalf("NewWireGuardTunnel: %v", err)
+	}
+	defer tun.Close()
+
+	err = tun.Ping6Core("fd00::2", 1, 2*time.Second)
+	if err == nil {
+		t.Fatal("Ping6Core on an unusable/unreachable path reported success; want error (fail closed)")
 	}
 }

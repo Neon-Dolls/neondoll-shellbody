@@ -13,6 +13,7 @@ package body
 import (
 	"encoding/json"
 	"errors"
+	"net/netip"
 )
 
 // MembershipStatus is the lifecycle state of this Body's network membership.
@@ -100,6 +101,34 @@ func UnmarshalMembership(raw string) (*Membership, error) {
 // network relationship.
 func (m *Membership) Active() bool {
 	return m != nil && m.Status == MembershipActive
+}
+
+// SelectCoreIPv6 returns a valid Core Doll Network IPv6 address from the
+// persisted CoreAddresses. It handles both bare IPv6 ("fd00::...") and
+// prefixed form ("fd00::.../128") as persisted by M2, normalizing both to the
+// bare compressed address (the form ping6/ICMPv6 needs; a "/128" is stripped).
+// Returns "" if no valid Core IPv6 address is found.
+func (m *Membership) SelectCoreIPv6() string {
+	if m == nil {
+		return ""
+	}
+	for _, a := range m.CoreAddresses {
+		if a == "" {
+			continue
+		}
+		if ip, err := netip.ParseAddr(a); err == nil {
+			if ip.Is6() && !ip.Is4In6() {
+				return ip.String()
+			}
+			continue
+		}
+		if prefix, err := netip.ParsePrefix(a); err == nil {
+			if prefix.Addr().Is6() && !prefix.Addr().Is4In6() {
+				return prefix.Addr().String()
+			}
+		}
+	}
+	return ""
 }
 
 // Valid checks that an active membership carries the fields required for the
