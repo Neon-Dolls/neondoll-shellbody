@@ -12,10 +12,16 @@ runs with **no Core required** and makes **no network connections**.
 real NeonDoll Core using the canonical Doll Network pairing v1 protocol,
 persisting the resulting relationship across restarts.
 
+**M3 — The Private Path** is now implemented: the Body can establish a real
+WireGuard tunnel to the paired Core through the canonical direct endpoint
+carried by the membership, assign its Doll Network IPv6 to a WireGuard
+interface, and reach the Core over the private path. `--connect` drives this
+from persisted M2 state; a privileged conformance test proves the full path
+against real kernel WireGuard.
+
 Deliberately **not** implemented yet (later milestones):
 
-- WireGuard tunnel establishment
-- Doll Network packet transport
+- Doll Network packet transport (application-layer)
 - Doll Link (`body.hello` over a connection)
 - Interaction Sessions
 - Shell command execution
@@ -56,7 +62,8 @@ Flags:
 || `--state-dir` | `.neondoll-shellbody` | directory for durable Body state |
 || `--init` | off | initialize a fresh state directory and exit |
 || `--status` | off | print the persisted Body identity and exit |
-|| `--pair` | *empty* | path to a canonical Doll Network invitation JSON (pair and exit) |
+||| `--pair` | *empty* | path to a canonical Doll Network invitation JSON (pair and exit) |
+||| `--connect` | off | bring up a real WireGuard tunnel to the paired Core from persisted membership and exit |
 || `--name` | `` | display name on the identity |
 || `--implementation` | `neondoll-shellbody` | implementation identifier |
 || `--platform` | runtime `GOOS` | platform identifier |
@@ -174,6 +181,41 @@ test** against a live NeonDoll Core. It proves:
 - Replaying a consumed invitation is rejected by the Core
   (`invitation_already_consumed`).
 
+## M3 acceptance proof
+
+In addition to M1/M2, `internal/tunnel` ships:
+
+1. **Unit tests** (`go test ./internal/tunnel`) that genuinely exercise the
+   tunnel constructor's validation (key length, host, port range, interface
+   defaulting and key cloning), the base64 key encoding `wg(8)` expects, and
+   the private-key wipe on `Close` — none of these are skip stubs.
+
+2. **A privileged real-WireGuard conformance test** that proves, against real
+   kernel WireGuard, the entire private path:
+
+   ```
+   Shell Body ─▶ real WireGuard ─▶ Doll Network IPv6 ─▶ Core
+   ```
+
+   `TestBodyPrivatePathToCore` builds two real WireGuard peers in isolated
+   network namespaces joined by an Ethernet veth pair (the canonical single-host
+   WireGuard CI topology), drives the Shell Body side entirely through the
+   production tunnel code (`NewWireGuardTunnel → Configure → Start →
+   Ping6Core`), and asserts ICMPv6 reaches the Core's Doll Network ULA through
+   the live tunnel. It only skips when the host cannot perform the proof:
+   not root (`CAP_NET_ADMIN`/`CAP_SYS_ADMIN`), missing WireGuard/tools, or
+   namespace creation unavailable. An IPv6-disabled host will therefore see
+   this test skip (documented); it is the canonical Doll Network path proof.
+
+   Run it on a capable host (root, WireGuard installed):
+
+   ```sh
+   sudo go test -run 'TestBodyPrivatePathToCore' ./internal/tunnel/ -count=1
+   ```
+
+   Ordinary CI (`go test -race ./...` as a non-root user) skips these
+   privileged tests; the non-privileged unit tests always run.
+
 ## Layout
 
 ```
@@ -182,6 +224,7 @@ internal/identity        Body identity, metadata, durable store
 internal/terminal        line-oriented terminal embodiment + lifecycle
 internal/dollnetwork     Independent canonical Doll Network v1 wire types
 internal/body            X25519/WG keypair, membership, store, pairing client
+internal/tunnel          Reusable WireGuard tunnel manager + private path
 ```
 
 ## License
