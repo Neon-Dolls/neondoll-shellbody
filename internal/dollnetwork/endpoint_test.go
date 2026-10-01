@@ -2,6 +2,7 @@ package dollnetwork
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -191,73 +192,116 @@ func TestParseDirectEndpoint(t *testing.T) {
 	}
 }
 
-// TestFromBootstrapURL tests deriving direct endpoints from bootstrap URLs.
-func TestFromBootstrapURL(t *testing.T) {
+// TestResolveDirectEndpointRejectsBootstrapURLs proves HTTP(S)/relay bootstrap
+// URLs are NOT converted into WireGuard UDP endpoints. An HTTP(S) bootstrap URL
+// identifies the pairing/bootstrap service; its port does not imply a WireGuard
+// UDP listener. Reinterpreting it would fabricate transport topology, so
+// ResolveDirectEndpoint must fail closed. This documents the public-protocol
+// hole: M2 pairing advertises only bootstrap URLs, which carry no unambiguous
+// direct WireGuard UDP endpoint.
+func TestResolveDirectEndpointRejectsBootstrapURLs(t *testing.T) {
+	httpURLWithPort := "https://core.example.com:51820"
 	tests := []struct {
-		name    string
-		input   string
-		want    *DirectEndpoint
-		wantErr bool
+		name      string
+		endpoints []string
 	}{
 		{
-			name:  "valid bootstrap URL with port",
-			input: "https://core.example.com:51820",
-			want: &DirectEndpoint{
-				Type:      "direct",
-				Host:      "core.example.com",
-				Port:      51820,
-				Transport: "udp",
-			},
-			wantErr: false,
+			name:      "HTTPS bootstrap URL with port is not a WG endpoint",
+			endpoints: []string{httpURLWithPort},
 		},
 		{
-			name:  "valid bootstrap URL with IPv6 and port",
-			input: "http://[fd00::1]:51820",
-			want: &DirectEndpoint{
-				Type:      "direct",
-				Host:      "fd00::1",
-				Port:      51820,
-				Transport: "udp",
-			},
-			wantErr: false,
+			name:      "HTTP bootstrap URL with IPv6 web port is not a WG endpoint",
+			endpoints: []string{"http://[fd00::1]:51820"},
 		},
 		{
-			name:    "bootstrap URL without port",
-			input:   "https://core.example.com/",
-			want:    nil,
-			wantErr: true, // ErrUnsupportedEndpoint with type "https:no-port"
+			name:      "relay URL is not a direct WG endpoint",
+			endpoints: []string{"relay://relay.example.net:9999"},
 		},
 		{
-			name:    "invalid URL",
-			input:   "not a url",
-			want:    nil,
-			wantErr: true,
+			name:      "mixed bootstrap URLs all fail closed",
+			endpoints: []string{"https://a.example.com:443", "https://b.example.com:8443", "relay://r.example.net:51820"},
 		},
 		{
-			name:    "URL with invalid port",
-			input:   "https://core.example.com:notaport",
-			want:    nil,
-			wantErr: true, // ErrUnsupportedEndpoint with type "https:invalid-port"
+			name:      "bootstrap URL next to malformed descriptor fails closed",
+			endpoints: []string{httpURLWithPort, "not a url or json"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ResolveDirectEndpoint(tt.endpoints)
+			if err == nil {
+				t.Fatalf("ResolveDirectEndpoint(%v) = %+v, want error: bootstrap URL must never fabricate a WG UDP endpoint", tt.endpoints, got)
+			}
+			// The error must name the protocol hole so operators can act.
+			if !strings.Contains(err.Error(), "protocol hole") {
+				t.Errorf("error does not report protocol hole: %v", err)
+			}
+		})
+	}
+}
+
+// TestResolveDirectEndpointStructuredOnly proves only an explicit structured
+// direct descriptor yields an endpoint, and it is still validated.
+func TestResolveDirectEndpointStructuredOnly(t *testing.T) {
+	structEP := `{"type":"direct","host":"203.0.113.50","port":51820,"transport":"udp"}`
+	relayEP := `{"type":"relay","relay_url":"https://relay.example.net/download","route_id":"opaque-route-id"}`
+	badUDP := `{"type":"direct","host":"203.0.113.50","port":70000,"transport":"udp"}`
+
+	tests := []struct {
+		name      string
+		endpoints []string
+		wantHost  string
+		wantPort  int
+		wantErr   bool
+	}{
+		{
+			name:      "structured direct descriptor works",
+			endpoints: []string{structEP},
+			wantHost:  "203.0.113.50",
+			wantPort:  51820,
 		},
 		{
-			name:    "URL with port out of range",
-			input:   "https://core.example.com:70000",
-			want:    nil,
-			wantErr: true, // ErrUnsupportedEndpoint with type "https:port-out-of-range"
+			name:      "structured descriptor preferred over HTTP bootstrap URL",
+			endpoints: []string{"https://legacy.example.com:1111", structEP},
+			wantHost:  "203.0.113.50",
+			wantPort:  51820,
+		},
+		{
+			name:      "relay descriptor fails closed",
+			endpoints: []string{relayEP},
+			wantErr:   true,
+		},
+		{
+			name:      "non-direct transport descriptor fails closed",
+			endpoints: []string{badUDP},
+			wantErr:   true,
+		},
+		{
+			name:      "empty endpoint list fails closed",
+			endpoints: []string{},
+			wantErr:   true,
+		},
+		{
+			name:      "malformed endpoint string fails closed",
+			endpoints: []string{"not a url or json"},
+			wantErr:   true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := FromBootstrapURL(tt.input)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("FromBootstrapURL() error = %v, wantErr %v", err, tt.wantErr)
+			got, err := ResolveDirectEndpoint(tt.endpoints)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("ResolveDirectEndpoint(%v) succeeded = %+v, want error (fail closed)", tt.endpoints, got)
+				}
 				return
 			}
-			if !tt.wantErr && got != nil {
-				if got.Type != tt.want.Type || got.Host != tt.want.Host || got.Port != tt.want.Port || got.Transport != tt.want.Transport {
-					t.Errorf("FromBootstrapURL() = %v, want %v", got, tt.want)
-				}
+			if err != nil {
+				t.Fatalf("ResolveDirectEndpoint(%v) unexpected error: %v", tt.endpoints, err)
+			}
+			if got.Host != tt.wantHost || got.Port != tt.wantPort {
+				t.Errorf("ResolveDirectEndpoint(%v) = %s:%d, want %s:%d", tt.endpoints, got.Host, got.Port, tt.wantHost, tt.wantPort)
 			}
 		})
 	}
@@ -335,98 +379,6 @@ func TestHostPort(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := tt.e.HostPort(); got != tt.want {
 				t.Errorf("HostPort() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-// TestResolveDirectEndpoint covers endpoint selection from the persisted Core
-// endpoint strings that the connect path reads. It must resolve the M2 URL form
-// persisted by real pairing, prefer a canonical structured direct descriptor
-// when one is present, and fail closed when no unambiguous direct WG UDP
-// endpoint exists (relay-only or port-less state).
-func TestResolveDirectEndpoint(t *testing.T) {
-	structEP := `{"type":"direct","host":"203.0.113.50","port":51820,"transport":"udp"}`
-	relayEP := `{"type":"relay","relay_url":"https://relay.example.net","route_id":"opaque-route-id"}`
-	badUDP := `{"type":"direct","host":"203.0.113.50","port":70000,"transport":"udp"}`
-
-	tests := []struct {
-		name      string
-		endpoints []string
-		wantHost  string
-		wantPort  int
-		wantErr   bool
-	}{
-		{
-			name:      "M2 URL form resolves to a direct endpoint",
-			endpoints: []string{"https://core.example.com:51820"},
-			wantHost:  "core.example.com",
-			wantPort:  51820,
-		},
-		{
-			name:      "structured direct descriptor works",
-			endpoints: []string{structEP},
-			wantHost:  "203.0.113.50",
-			wantPort:  51820,
-		},
-		{
-			name:      "structured descriptor preferred over M2 URL",
-			endpoints: []string{"https://legacy.example.com:1111", structEP},
-			wantHost:  "203.0.113.50",
-			wantPort:  51820,
-		},
-		{
-			name:      "IPv6 M2 URL form resolves",
-			endpoints: []string{"http://[fd00::1]:51820"},
-			wantHost:  "fd00::1",
-			wantPort:  51820,
-		},
-		{
-			name:      "port-less bootstrap URL fails closed",
-			endpoints: []string{"https://core.example.com/"},
-			wantErr:   true,
-		},
-		{
-			name:      "relay descriptor fails closed",
-			endpoints: []string{relayEP},
-			wantErr:   true,
-		},
-		{
-			name:      "relay:// URL fails closed (not reinterpreted as direct)",
-			endpoints: []string{"relay://relay.example.net:9999"},
-			wantErr:   true,
-		},
-		{
-			name:      "non-direct transport descriptor fails closed",
-			endpoints: []string{badUDP},
-			wantErr:   true,
-		},
-		{
-			name:      "empty endpoint list fails closed",
-			endpoints: []string{},
-			wantErr:   true,
-		},
-		{
-			name:      "malformed endpoint string fails closed",
-			endpoints: []string{"not a url or json"},
-			wantErr:   true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := ResolveDirectEndpoint(tt.endpoints)
-			if tt.wantErr {
-				if err == nil {
-					t.Fatalf("ResolveDirectEndpoint(%v) succeeded = %+v, want error (fail closed)", tt.endpoints, got)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("ResolveDirectEndpoint(%v) unexpected error: %v", tt.endpoints, err)
-			}
-			if got.Host != tt.wantHost || got.Port != tt.wantPort {
-				t.Errorf("ResolveDirectEndpoint(%v) = %s:%d, want %s:%d", tt.endpoints, got.Host, got.Port, tt.wantHost, tt.wantPort)
 			}
 		})
 	}

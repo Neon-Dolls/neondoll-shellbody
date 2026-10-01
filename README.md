@@ -12,12 +12,21 @@ runs with **no Core required** and makes **no network connections**.
 real NeonDoll Core using the canonical Doll Network pairing v1 protocol,
 persisting the resulting relationship across restarts.
 
-**M3 — The Private Path** is now implemented: the Body can establish a real
-WireGuard tunnel to the paired Core through the canonical direct endpoint
-carried by the membership, assign its Doll Network IPv6 to a WireGuard
+**M3 — The Private Path** is largely implemented: the Body can establish a real
+WireGuard tunnel to the paired Core, assign its Doll Network IPv6 to a WireGuard
 interface, and reach the Core over the private path. `--connect` drives this
-from persisted M2 state; a privileged conformance test proves the full path
-against real kernel WireGuard.
+from persisted M2 state after resolving an explicit **structured direct
+WireGuard endpoint descriptor** carried by the membership, and only then
+pinging the Core to prove reachability before reporting success.
+
+**Important caveat:** the current public Doll Network contract advertises Core
+endpoints only as pairing/bootstrap URLs, which do **not** contain an
+unambiguous direct WireGuard UDP endpoint. Until the contract is fixed (see
+[Known protocol hole](#known-protocol-hole-no-direct-wireguard-udp-endpoint-is-advertised)),
+a membership produced against a real M2-era Core has no direct descriptor, so
+`--connect` fails closed with a clear protocol-hole error instead of guessing.
+The Shell Body side of the private path, and a privileged conformance test
+proving it against real kernel WireGuard, ship now.
 
 Deliberately **not** implemented yet (later milestones):
 
@@ -63,7 +72,7 @@ Flags:
 || `--init` | off | initialize a fresh state directory and exit |
 || `--status` | off | print the persisted Body identity and exit |
 ||| `--pair` | *empty* | path to a canonical Doll Network invitation JSON (pair and exit) |
-||| `--connect` | off | bring up a real WireGuard tunnel to the paired Core from persisted membership and exit |
+|||| `--connect` | off | bring up a real WireGuard tunnel to the paired Core from persisted membership and exit (fails closed if no direct WG endpoint descriptor is advertised) |
 || `--name` | `` | display name on the identity |
 || `--implementation` | `neondoll-shellbody` | implementation identifier |
 || `--platform` | runtime `GOOS` | platform identifier |
@@ -215,6 +224,44 @@ In addition to M1/M2, `internal/tunnel` ships:
 
    Ordinary CI (`go test -race ./...` as a non-root user) skips these
    privileged tests; the non-privileged unit tests always run.
+
+## Known protocol hole: no direct WireGuard UDP endpoint is advertised
+
+`--connect` requires an **unambiguous direct WireGuard UDP endpoint** for the
+paired Core. The Shell Body accepts one — and only one — form for that: an
+explicit structured direct descriptor carried by the membership document:
+
+```json
+{ "type": "direct", "host": "203.0.113.20", "port": 51820, "transport": "udp" }
+```
+
+It deliberately does **not** derive a WireGuard endpoint from an HTTP(S)
+bootstrap URL. An HTTP(S) bootstrap URL identifies the **pairing/bootstrap
+service**; its port is a web/TLS listener port and does **not** imply a
+WireGuard UDP listener on the same port. Reinterpreting
+`https://core.example.com:51820` as "direct UDP `core.example.com:51820`" would
+guess transport topology and is exactly the bug this milestone removes. Relay
+URLs (`relay://…`) and relay descriptors stay unsupported and fail closed.
+
+**Consequence:** the current public Doll Network contract (M2 pairing) advertises
+Core endpoints only as pairing/bootstrap URLs, so a membership produced by a
+real M2-era Core carries **no** unambiguous direct WireGuard UDP endpoint. In
+that situation `--connect` does not guess — it terminates with a clear
+"protocol hole" error explaining that no direct WireGuard UDP endpoint was
+advertised.
+
+This is a **contract defect to fix on the Core/Doll Network side, separately**
+(not in this PR, which does not modify the protocol or the Core):
+
+- the canonical pair response should advertise, alongside its bootstrap URLs, an
+  explicit structured direct endpoint descriptor (`type`/`host`/`port`/
+  `transport`) for any WireGuard UDP listener the Core actually exposes; and
+- the canonical contract should define how `relay://` bootstrap endpoints and
+  direct WireGuard endpoints coexist, so a Body can select a direct path when
+  one exists and fall back to relay otherwise.
+
+Until that descriptor is advertised, `--connect` fails closed rather than
+inventing a WireGuard endpoint.
 
 ## Layout
 

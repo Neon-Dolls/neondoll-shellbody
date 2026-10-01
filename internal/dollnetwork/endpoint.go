@@ -20,8 +20,6 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
-	"net/url"
-	"strconv"
 	"strings"
 )
 
@@ -119,73 +117,26 @@ func (e *DirectEndpoint) HostPort() string {
 	return fmt.Sprintf("%s:%d", e.Host, e.Port)
 }
 
-// FromBootstrapURL derives a DirectEndpoint from an http(s) bootstrap URL when
-// a port is present in that URL. This is a MIGRATION helper for memberships
-// persisted by M2, which carried only URL-based bootstrap endpoints. Runtime
-// M3 prefers an explicit canonical descriptor; this helper exists so a Body
-// paired against an M2-era Core can still resolve a real direct endpoint rather
-// than guessing. It returns ErrUnsupportedEndpoint when the URL has no usable
-// port (so callers can tell "no direct endpoint yet" apart from parse errors).
-func FromBootstrapURL(rawURL string) (*DirectEndpoint, error) {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return nil, fmt.Errorf("dollnetwork: invalid bootstrap URL %q: %w", rawURL, err)
-	}
-	scheme := u.Scheme
-	// Only the direct transports (http/https) can yield a direct WG endpoint.
-	// A relay:// URL advertises transit via a relay, not a direct UDP endpoint;
-	// silently reinterpreting it as direct would fabricate a route. We reject
-	// it explicitly so callers can report the limitation instead of guessing.
-	if scheme != "http" && scheme != "https" {
-		return nil, &ErrUnsupportedEndpoint{Type: fmt.Sprintf("%s:not-direct-transport", schemeOr(scheme))}
-	}
-	host := u.Hostname()
-	if host == "" {
-		return nil, &ErrUnsupportedEndpoint{Type: "http:no-host"}
-	}
-	portStr := u.Port()
-	if portStr == "" {
-		return nil, &ErrUnsupportedEndpoint{Type: fmt.Sprintf("%s:no-port", scheme)}
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return nil, &ErrUnsupportedEndpoint{Type: fmt.Sprintf("%s:invalid-port", scheme)}
-	}
-	if port < 1 || port > 65535 {
-		return nil, &ErrUnsupportedEndpoint{Type: fmt.Sprintf("%s:port-out-of-range", scheme)}
-	}
-	ep := &DirectEndpoint{
-		Type:      "direct",
-		Host:      host,
-		Port:      port,
-		Transport: DirectTransport,
-	}
-	if err := ep.ValidDirect(); err != nil {
-		return nil, err
-	}
-	return ep, nil
-}
-
-// schemeOr returns the scheme, or "(empty)" when it is missing (unreachable
-// guard against a URL parse that yields an empty scheme).
-func schemeOr(s string) string {
-	if s == "" {
-		return "(empty)"
-	}
-	return s
-}
+// NOTE: there is intentionally no FromBootstrapURL helper here anymore.
+// Historically we derived a "direct WireGuard UDP endpoint" from an HTTP(S)
+// bootstrap URL by copying the URL's port into a DirectEndpoint. That is wrong:
+// an HTTP(S) bootstrap URL identifies the pairing/bootstrap service, and its
+// port does NOT imply a WireGuard UDP listener on the same port. Reinterpreting
+// it as a WG endpoint fabricates transport topology. This repository no longer
+// does that — see ResolveDirectEndpoint.
 
 // ResolveDirectEndpoint picks an unambiguous direct WireGuard UDP endpoint from
-// the persisted Core endpoint strings carried by Shell Body membership. M3
-// prefers a canonical structured descriptor (JSON DirectEndpoint with a direct
-// UDP transport); when only M2-form bootstrap URLs were persisted it falls back
-// to FromBootstrapURL — the explicit migration helper — so a Body paired
-// through the real M2 flow can resolve a genuine direct endpoint. Relay-only or
-// otherwise ambiguous state (port-less URLs, non-direct transports, malformed
-// descriptors) fails closed with a descriptive error so callers never guess at
-// a WireGuard UDP endpoint.
+// the persisted Core endpoint strings carried by Shell Body membership. It
+// accepts ONLY the canonical structured descriptor (a JSON DirectEndpoint with a
+// direct UDP transport). HTTP(S) bootstrap URLs advertise the pairing/bootstrap
+// service, not a WG UDP listener; relay URLs advertise transit via a relay. Both
+// fail closed here — we never guess a WireGuard UDP endpoint from a URL. If the
+// membership carries no structured direct descriptor (e.g. it was paired through
+// an M2-era Core that persisted only bootstrap URLs), this returns a clear
+// protocol-hole error: the current public Doll Network contract does not
+// advertise an unambiguous direct WireGuard UDP endpoint.
 func ResolveDirectEndpoint(coreEndpoints []string) (*DirectEndpoint, error) {
-	// Preferred pass: canonical structured descriptors.
+	// Preferred (only) pass: canonical structured descriptors.
 	for _, s := range coreEndpoints {
 		ep, err := ParseDirectEndpoint(s)
 		if err == nil {
@@ -194,15 +145,21 @@ func ResolveDirectEndpoint(coreEndpoints []string) (*DirectEndpoint, error) {
 			}
 		}
 	}
-	// Migration pass: M2 URL form, resolved only through the sanctioned helper.
-	for _, s := range coreEndpoints {
-		ep, err := FromBootstrapURL(s)
-		if err == nil && ep.ValidDirect() == nil {
-			return ep, nil
-		}
+	// No structured direct descriptor persisted. If we were handed any endpoint
+	// strings at all, they are the URL-form bootstrap endpoints M2 actually
+	// persists (HTTP(S) pairing/bootstrap or relay). Report the protocol hole
+	// plainly rather than inventing a WireGuard UDP endpoint.
+	if len(coreEndpoints) == 0 {
+		return nil, errors.New(
+			"no Core endpoints persisted in membership; cannot resolve a WireGuard endpoint")
 	}
 	return nil, errors.New(
-		"no unambiguous direct WireGuard UDP endpoint in persisted Core endpoints: " +
-			"the current public protocol persists pairing/bootstrap URLs; a Core that advertises " +
-			"only relay or port-less endpoints cannot yield a direct WG UDP endpoint")
+		"protocol hole: no direct WireGuard UDP endpoint was advertised for Core. " +
+			"Persisted Core endpoints are pairing/bootstrap URLs (HTTP(S) and/or relay), " +
+			"whose ports identify the bootstrap service, not a guaranteed WireGuard UDP " +
+			"listener. The current public Doll Network contract (M2 pairing) does not " +
+			"advertise an unambiguous direct WireGuard UDP endpoint. A Core that publishes " +
+			"a structured direct descriptor ({\"type\":\"direct\",\"host\":...,\"port\":...," +
+			"\"transport\":\"udp\"}) is required for --connect; the contract must be fixed " +
+			"(see README M3 notes) to carry that descriptor.")
 }
