@@ -21,8 +21,10 @@ import (
 	"time"
 
 	"github.com/Neon-Dolls/neondoll-shellbody/internal/body"
+	"github.com/Neon-Dolls/neondoll-shellbody/internal/dollnetwork"
 	"github.com/Neon-Dolls/neondoll-shellbody/internal/identity"
 	"github.com/Neon-Dolls/neondoll-shellbody/internal/terminal"
+	"github.com/Neon-Dolls/neondoll-shellbody/internal/tunnel"
 )
 
 // Version is the build/version stamp. It is overridable at link time via
@@ -48,6 +50,7 @@ func run(args []string) error {
 	statusMode := fs.Bool("status", false, "print the persisted Body identity and pairing status")
 	initMode := fs.Bool("init", false, "initialize a fresh state directory with a new Body identity and exit")
 	pairMode := fs.String("pair", "", "pair with a Core by consuming an invitation JSON file, then exit")
+	connectMode := fs.Bool("connect", false, "establish a WireGuard tunnel to the paired Core using persisted state")
 
 	// Options.
 	stateDir := fs.String("state-dir", ".neondoll-shellbody", "directory for durable Body state")
@@ -81,6 +84,8 @@ func run(args []string) error {
 		return initStandalone(store, *name, meta)
 	case *pairMode != "":
 		return pair(store, *pairMode)
+	case *connectMode:
+		return connect(store)
 	default:
 		return interactive(store, *name, meta)
 	}
@@ -131,6 +136,110 @@ func status(store *body.Store) error {
 	fmt.Printf("body_ipv6: %s\n", mem.BodyIPv6)
 	fmt.Printf("core_peer: %s\n", mem.CorePeerID)
 	fmt.Printf("core_wg:   %s\n", mem.CoreWGKeyB64)
+	return nil
+}
+
+// connect establishes a WireGuard tunnel to the paired Core using persisted M2 state.
+// It fails explicitly when: Body is not paired, membership is corrupt, required Core
+// endpoint is missing/invalid, WG configuration fails, or Core cannot be reached
+// through the private path.
+// It never creates a new identity, generates a new WG key, re-pairs, or allocates
+// a new Doll Network address.
+func connect(store *body.Store) error {
+	// Load persisted identity and membership
+	_, kp, err := store.LoadOrError()
+	if err != nil {
+		if errors.Is(err, body.ErrStateNotFound) {
+			return errors.New("no identity yet (run --init or start interactively)")
+		}
+		return err
+	}
+
+	mem, err := store.LoadMembership()
+	if err != nil {
+		if errors.Is(err, body.ErrStateNotFound) {
+			return errors.New("body is not paired (run --pair first)")
+		}
+		return err
+	}
+
+	// Validate that we have all required M2 state for WireGuard
+	if mem.BodyIPv6 == "" {
+		return errors.New("membership corrupt: missing Body assigned Doll Network IPv6")
+	}
+	if mem.CorePeerID == "" {
+		return errors.New("membership corrupt: missing Core peer ID")
+	}
+	if mem.CoreWGKeyB64 == "" {
+		return errors.New("membership corrupt: missing Core WG public key")
+	}
+	if len(mem.CoreEndpoints) == 0 {
+		return errors.New("membership corrupt: missing Core endpoint(s)")
+	}
+
+	// Resolve an unambiguous direct WireGuard UDP endpoint for Core from the
+	// persisted state. This supports both the canonical structured descriptor
+	// (M3) and the M2 URL form actually persisted by real pairing; it fails
+	// closed if no unambiguous direct endpoint is present.
+	coreEP, err := dollnetwork.ResolveDirectEndpoint(mem.CoreEndpoints)
+	if err != nil {
+		return err
+	}
+
+	// Decode the Body's private key (never exposed in logs)
+	bodyKey := kp.PrivateKeyBytes() // This gives us the raw private key bytes
+
+	// Decode Core's public key
+	coreKey, err := dollnetwork.DecodeWgPublicKey(mem.CoreWGKeyB64)
+	if err != nil {
+		return fmt.Errorf("invalid Core WG public key: %w", err)
+	}
+
+	// Create and configure the WireGuard tunnel
+	tun, err := tunnel.NewWireGuardTunnel(
+		"wg0",
+		bodyKey,
+		coreKey,
+		mem.BodyIPv6,
+		coreEP.Host,
+		coreEP.Port,
+		"", // netns - empty for default namespace
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create tunnel: %w", err)
+	}
+	defer tun.Close() // Ensure cleanup
+
+	// Configure the tunnel
+	if err := tun.Configure(); err != nil {
+		return fmt.Errorf("failed to configure tunnel: %w", err)
+	}
+
+	// Start the tunnel interface
+	if err := tun.Start(); err != nil {
+		return fmt.Errorf("failed to start tunnel: %w", err)
+	}
+	defer tun.Stop() // Ensure we stop it
+
+	// Select Core IPv6 from persisted membership and verify connectivity
+	coreIPv6 := mem.SelectCoreIPv6()
+	if coreIPv6 == "" {
+		return errors.New("no valid Core IPv6 address found in membership")
+	}
+
+	// Verify connectivity by pinging the Core's IPv6 over the WG interface
+	if err := tun.Ping6Core(coreIPv6, 1, 5*time.Second); err != nil {
+		return fmt.Errorf("failed to reach Core over WG: %w", err)
+	}
+
+	fmt.Printf("WireGuard tunnel established successfully:\n")
+	fmt.Printf("  Interface: wg0\n")
+	fmt.Printf("  Body IPv6: %s\n", mem.BodyIPv6)
+	fmt.Printf("  Core IPv6: %s\n", coreIPv6)
+	fmt.Printf("  Core peer ID: %s\n", mem.CorePeerID)
+	fmt.Printf("  Core endpoint: %s:%d\n", coreEP.Host, coreEP.Port)
+	fmt.Printf("  Network ID: %s\n", mem.NetworkID)
+
 	return nil
 }
 
