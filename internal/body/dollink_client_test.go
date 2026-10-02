@@ -452,21 +452,13 @@ func TestClientExecutionRequest(t *testing.T) {
 	}
 }
 
-// TestClientSessionOpen tests handling of session.open messages.
-func TestClientSessionOpen(t *testing.T) {
+// TestClientSessionOpenRemoved verifies the M4 client no longer performs active
+// session.open handling: receiving session.open must not produce a session.opened
+// reply. The M4 client is not session-aware, so an incoming session.open is an
+// unhandled message and the client reports it as such instead of opening a session.
+func TestClientSessionOpenRemoved(t *testing.T) {
 	ft := NewFakeTransport()
 	client := NewClient(ft, "test-body-id")
-
-	// Set up a session.open handler so the client can reply with session.opened.
-	handlerCalled := make(chan struct{}, 1)
-	client.SetSessionOpenHandler(func(ctx context.Context, req link.SessionOpenPayload) (link.SessionOpenedPayload, error) {
-		handlerCalled <- struct{}{}
-		return link.SessionOpenedPayload{
-			SessionID:  "sess_123",
-			Capability: "test-capability",
-			Metadata:   map[string]string{"foo": "bar"},
-		}, nil
-	})
 
 	errc := make(chan error, 1)
 	go func() {
@@ -523,22 +515,14 @@ func TestClientSessionOpen(t *testing.T) {
 			errc <- fmt.Errorf("expected body.ready, got %s", bodyReady.Type)
 			return
 		}
-		// 5. Send session.open to the client.
-		sessionOpenPayload, err := json.Marshal(link.SessionOpenPayload{
-			LocalSessionID: "local_sess_123",
-			Kind:           "test-kind",
-			Metadata:       map[string]string{"foo": "bar"},
-		})
-		if err != nil {
-			errc <- fmt.Errorf("failed to marshal session.open: %v", err)
-			return
-		}
+		// 5. Send session.open. No active handler exists, so no session.opened reply
+		// is generated; the client treats it as an unhandled message and fails.
 		sessionOpen := link.Envelope{
 			Type:      link.TypeSessionOpen,
 			ID:        "evt_session_open",
 			BodyID:    "test-body-id",
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Payload:   sessionOpenPayload,
+			Payload:   json.RawMessage(`{"local_session_id":"local_sess_123","kind":"test-kind"}`),
 		}
 		sessionOpenData, err := json.Marshal(sessionOpen)
 		if err != nil {
@@ -546,31 +530,6 @@ func TestClientSessionOpen(t *testing.T) {
 			return
 		}
 		ft.recvCh <- sessionOpenData
-
-		// 6. Receive the client's session.opened reply.
-		data = <-ft.sendCh
-		var sessionOpened link.Envelope
-		if err := json.Unmarshal(data, &sessionOpened); err != nil {
-			errc <- fmt.Errorf("failed to unmarshal session.opened: %v", err)
-			return
-		}
-		if sessionOpened.Type != link.TypeSessionOpened {
-			errc <- fmt.Errorf("expected session.opened, got %s", sessionOpened.Type)
-			return
-		}
-		var sessionOpenedPayload link.SessionOpenedPayload
-		if err := json.Unmarshal(sessionOpened.Payload, &sessionOpenedPayload); err != nil {
-			errc <- fmt.Errorf("failed to unmarshal session.opened payload: %v", err)
-			return
-		}
-		if sessionOpenedPayload.SessionID != "sess_123" {
-			errc <- fmt.Errorf("expected session ID \"sess_123\", got %s", sessionOpenedPayload.SessionID)
-			return
-		}
-		if sessionOpenedPayload.Capability != "test-capability" {
-			errc <- fmt.Errorf("expected capability \"test-capability\", got %s", sessionOpenedPayload.Capability)
-			return
-		}
 		errc <- nil
 	}()
 
@@ -581,6 +540,7 @@ func TestClientSessionOpen(t *testing.T) {
 		clientDone <- client.Run(ctx)
 	}()
 
+	// Peer completes its script without error.
 	select {
 	case err := <-errc:
 		if err != nil {
@@ -589,21 +549,21 @@ func TestClientSessionOpen(t *testing.T) {
 	case <-time.After(time.Second * 5):
 		t.Fatalf("timed out waiting for peer")
 	}
-	select {
-	case <-handlerCalled:
-		// good
-	case <-time.After(time.Second * 1):
-		t.Fatal("session.open handler was not called")
-	}
-	cancel()
+
+	// Client must fail on the unhandled session.open (it does not open a session
+	// nor emit session.opened).
 	select {
 	case err := <-clientDone:
-		if err != nil && !errors.Is(err, context.Canceled) {
-			t.Fatalf("client run failed after cancel: %v", err)
+		if err == nil {
+			t.Fatal("expected client run to fail on unhandled session.open")
 		}
-	case <-time.After(time.Second * 1):
-		t.Fatal("client run did not return after cancel")
+		if !strings.Contains(err.Error(), "session.open") {
+			t.Fatalf("expected session.open to be unhandled, got %v", err)
+		}
+	case <-time.After(time.Second * 5):
+		t.Fatal("client run did not return after unhandled session.open")
 	}
+	cancel()
 }
 
 // TestClientBodyEvent tests handling of body.event messages.

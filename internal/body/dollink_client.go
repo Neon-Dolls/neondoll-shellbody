@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"time"
 
@@ -52,8 +53,6 @@ type Client struct {
 	done chan struct{}
 	// onExecutionRequest is called when an execution.request is received.
 	onExecutionRequest func(ctx context.Context, req link.ExecutionRequestPayload) (link.ExecutionResultPayload, error)
-	// onSessionOpen is called when a session.open is received.
-	onSessionOpen func(ctx context.Context, req link.SessionOpenPayload) (link.SessionOpenedPayload, error)
 	// onBodyEvent is called when a body.event is received (for observation).
 	onBodyEvent func(ctx context.Context, ev link.EventPayload) error
 }
@@ -65,8 +64,8 @@ func NewClient(t Transport, bodyID string) *Client {
 		BodyID:         bodyID,
 		BodyType:       "shell",
 		Implementation: "neondoll-shellbody",
-		Platform:       "linux",
-		Architecture:   "amd64",
+		Platform:       runtime.GOOS,
+		Architecture:   runtime.GOARCH,
 		done:           make(chan struct{}),
 	}
 }
@@ -76,13 +75,6 @@ func (c *Client) SetExecutionRequestHandler(h func(ctx context.Context, req link
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.onExecutionRequest = h
-}
-
-// SetSessionOpenHandler sets the handler for session.open messages.
-func (c *Client) SetSessionOpenHandler(h func(ctx context.Context, req link.SessionOpenPayload) (link.SessionOpenedPayload, error)) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.onSessionOpen = h
 }
 
 // SetBodyEventHandler sets the handler for body.event messages.
@@ -156,23 +148,85 @@ func (c *Client) Run(ctx context.Context) error {
 	}
 }
 
+// advertisedVersionRange is a single source of truth for the Doll Link and
+// Body Contract version ranges this Body advertises during negotiation.
+type advertisedVersionRange struct {
+	DollLink     link.VersionSpec
+	BodyContract link.VersionSpec
+}
+
+// advertisedRanges returns the version ranges this Body advertises.
+func (c *Client) advertisedRanges() advertisedVersionRange {
+	return advertisedVersionRange{
+		DollLink:     link.VersionSpec{MinVersion: 1, MaxVersion: 1},
+		BodyContract: link.VersionSpec{MinVersion: 1, MaxVersion: 1},
+	}
+}
+
+// selectVersion validates that the selected version present in core.hello falls
+// within the advertised spec range. It returns the version and true when the
+// selection is present and in-range; missing, zero, or out-of-range selections
+// are rejected.
+func (r advertisedVersionRange) selectVersion(selected *int, spec link.VersionSpec) (int, bool) {
+	if selected == nil || *selected == 0 || *selected < spec.MinVersion || *selected > spec.MaxVersion {
+		return 0, false
+	}
+	return *selected, true
+}
+
 // negotiateVersions performs the version negotiation handshake.
 func (c *Client) negotiateVersions(ctx context.Context) error {
+	ranges := c.advertisedRanges()
+
 	// 1. Send body.hello
+	if err := c.sendHello(ctx, ranges); err != nil {
+		return err
+	}
+
+	// 2. Receive core.hello.
+	resp, err := c.Transport.Receive(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to receive core.hello: %w", err)
+	}
+	if resp.Type != link.TypeCoreHello {
+		return fmt.Errorf("expected core.hello, got %s", resp.Type)
+	}
+	var coreHelloPayload struct {
+		DollLinkVersion     *int `json:"doll_link_version"`
+		BodyContractVersion *int `json:"body_contract_version"`
+	}
+	if err := json.Unmarshal(resp.Payload, &coreHelloPayload); err != nil {
+		return fmt.Errorf("failed to unmarshal core.hello payload: %w", err)
+	}
+
+	// 3. Validate Core's selected versions against our advertised ranges.
+	dollLink, okDollLink := ranges.selectVersion(coreHelloPayload.DollLinkVersion, ranges.DollLink)
+	bodyContract, okBody := ranges.selectVersion(coreHelloPayload.BodyContractVersion, ranges.BodyContract)
+	if !okDollLink {
+		return fmt.Errorf("negotiation failed: Core selected unsupported Doll Link version (advertised %d-%d)", ranges.DollLink.MinVersion, ranges.DollLink.MaxVersion)
+	}
+	if !okBody {
+		return fmt.Errorf("negotiation failed: Core selected unsupported Body Contract version (advertised %d-%d)", ranges.BodyContract.MinVersion, ranges.BodyContract.MaxVersion)
+	}
+
+	c.mu.Lock()
+	c.negotiatedVersions.DollLink = dollLink
+	c.negotiatedVersions.BodyContract = bodyContract
+	c.mu.Unlock()
+
+	return nil
+}
+
+// sendHello sends the body.hello advertisement including the advertised ranges.
+func (c *Client) sendHello(ctx context.Context, ranges advertisedVersionRange) error {
 	payloadBytes, err := json.Marshal(link.HelloPayload{
 		BodyType:       c.BodyType,
 		Implementation: c.Implementation,
 		Platform:       c.Platform,
 		Architecture:   c.Architecture,
-		DollLink: link.VersionSpec{
-			MinVersion: 1,
-			MaxVersion: 1,
-		},
-		BodyContract: link.VersionSpec{
-			MinVersion: 1,
-			MaxVersion: 1,
-		},
-		Build: 0,
+		DollLink:       ranges.DollLink,
+		BodyContract:   ranges.BodyContract,
+		Build:          0,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to marshal body.hello payload: %w", err)
@@ -187,27 +241,6 @@ func (c *Client) negotiateVersions(ctx context.Context) error {
 	if err := c.Transport.Send(ctx, bodyHello); err != nil {
 		return fmt.Errorf("failed to send body.hello: %w", err)
 	}
-
-	// 2. Receive core.hello.
-	resp, err := c.Transport.Receive(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to receive core.hello: %w", err)
-	}
-	if resp.Type != link.TypeCoreHello {
-		return fmt.Errorf("expected core.hello, got %s", resp.Type)
-	}
-	var coreHelloPayload struct {
-		DollLinkVersion     int `json:"doll_link_version"`
-		BodyContractVersion int `json:"body_contract_version"`
-	}
-	if err := json.Unmarshal(resp.Payload, &coreHelloPayload); err != nil {
-		return fmt.Errorf("failed to unmarshal core.hello payload: %w", err)
-	}
-	c.mu.Lock()
-	c.negotiatedVersions.DollLink = coreHelloPayload.DollLinkVersion
-	c.negotiatedVersions.BodyContract = coreHelloPayload.BodyContractVersion
-	c.mu.Unlock()
-
 	return nil
 }
 func (c *Client) advertiseCapabilities(ctx context.Context) error {
@@ -316,40 +349,6 @@ func (c *Client) handleMessage(ctx context.Context, msg *link.Envelope) error {
 		}
 		if err := c.Transport.Send(ctx, out); err != nil {
 			return fmt.Errorf("failed to send execution.result: %w", err)
-		}
-		return nil
-
-	case link.TypeSessionOpen:
-		var req link.SessionOpenPayload
-		if err := json.Unmarshal(msg.Payload, &req); err != nil {
-			return fmt.Errorf("failed to unmarshal session.open: %w", err)
-		}
-		c.mu.RLock()
-		h := c.onSessionOpen
-		c.mu.RUnlock()
-		if h == nil {
-			// No handler: we could return an error, but for now we just ignore.
-			return nil
-		}
-		res, err := h(ctx, req)
-		if err != nil {
-			return fmt.Errorf("session.open handler failed: %w", err)
-		}
-		out := link.Envelope{
-			Type:          link.TypeSessionOpened,
-			ID:            generateID(),
-			CorrelationID: msg.ID,
-			BodyID:        c.BodyID,
-			Timestamp:     time.Now().UTC().Format(time.RFC3339),
-			Payload:       json.RawMessage{},
-		}
-		if marshaled, err := json.Marshal(res); err != nil {
-			return fmt.Errorf("failed to marshal session.opened: %w", err)
-		} else {
-			out.Payload = marshaled
-		}
-		if err := c.Transport.Send(ctx, out); err != nil {
-			return fmt.Errorf("failed to send session.opened: %w", err)
 		}
 		return nil
 
