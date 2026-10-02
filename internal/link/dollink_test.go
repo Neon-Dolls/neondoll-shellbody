@@ -114,24 +114,3 @@ func TestUnknownMessageType(t *testing.T) {
 		t.Fatalf("expected empty ID after error, got %s", env.ID)
 	}
 }
-
-func TestGenerateIDFormat(t *testing.T) {
-	id := generateID()
-	if id == "" {
-		t.Fatalf("generateID returned empty string")
-	}
-	// Should start with "evt_"
-	if len(id) < 5 || id[:4] != "evt_" {
-		t.Fatalf("generateID does not start with 'evt_': %s", id)
-	}
-	// Should have numeric suffix
-	if _, err := parseIDSuffix(id); err != nil {
-		t.Fatalf("generateID suffix not numeric: %v", err)
-	}
-}
-
-func parseIDSuffix(id string) (int64, error) {
-	var n int64
-	_, err := fmt.Sscanf(id, "evt_%d", &n)
-	return n, err
-}

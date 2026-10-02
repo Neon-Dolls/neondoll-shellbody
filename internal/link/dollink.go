@@ -238,12 +238,3 @@ type DelegationResultPayload struct {
 	Status       string                 `json:"status,omitempty"` // "success", "denied", etc.
 	Result       map[string]interface{} `json:"result,omitempty"`
 }
-
-// generateID creates a simple monotonically increasing ID for demo/testing.
-// In production, we should use a proper unique identifier (e.g., UUID).
-var idCounter int64
-
-func generateID() string {
-	idCounter++
-	return fmt.Sprintf("evt_%d", idCounter)
-}
