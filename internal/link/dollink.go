@@ -40,14 +40,15 @@ const (
 )
 
 // Envelope is the common Doll Link message envelope.
+// Payload is raw JSON bytes at the wire boundary.
 type Envelope struct {
-	Type          MessageType `json:"type"`
-	ID            string      `json:"id,omitempty"`
-	Timestamp     string      `json:"timestamp,omitempty"`
-	DollID        string      `json:"doll_id,omitempty"`
-	BodyID        string      `json:"body_id,omitempty"`
-	CorrelationID string      `json:"correlation_id,omitempty"`
-	Payload       interface{} `json:"payload,omitempty"`
+	Type          MessageType     `json:"type"`
+	ID            string          `json:"id,omitempty"`
+	Timestamp     string          `json:"timestamp,omitempty"`
+	DollID        string          `json:"doll_id,omitempty"`
+	BodyID        string          `json:"body_id,omitempty"`
+	CorrelationID string          `json:"correlation_id,omitempty"`
+	Payload       json.RawMessage `json:"payload,omitempty"`
 }
 
 // UnmarshalJSON validates the message type and then uses the default struct unmarshaling.
@@ -101,9 +102,9 @@ type HelloPayload struct {
 
 // CoreHelloPayload contains the version negotiation information from Core to Body.
 type CoreHelloPayload struct {
-	DollLink       VersionSpec `json:"doll_link,omitempty"`
-	CoreContract   VersionSpec `json:"core_contract,omitempty"`
-	Build          int         `json:"build,omitempty"`
+	DollLink     VersionSpec `json:"doll_link,omitempty"`
+	CoreContract VersionSpec `json:"core_contract,omitempty"`
+	Build        int         `json:"build,omitempty"`
 }
 
 // VersionSpec describes version ranges for protocol negotiation.
@@ -188,29 +189,29 @@ type ExecutionCancelPayload struct {
 
 // SessionOpenPayload represents a request to open a session.
 type SessionOpenPayload struct {
-	LocalSessionID string                 `json:"local_session_id,omitempty"`
-	Kind           string                 `json:"kind,omitempty"`
-	Metadata       map[string]string      `json:"metadata,omitempty"`
+	LocalSessionID string            `json:"local_session_id,omitempty"`
+	Kind           string            `json:"kind,omitempty"`
+	Metadata       map[string]string `json:"metadata,omitempty"`
 }
 
 // SessionOpenedPayload represents a session that has been opened.
 type SessionOpenedPayload struct {
-	SessionID   string                 `json:"session_id,omitempty"`
-	Capability  string                 `json:"capability,omitempty"`
-	Metadata    map[string]string      `json:"metadata,omitempty"`
+	SessionID  string            `json:"session_id,omitempty"`
+	Capability string            `json:"capability,omitempty"`
+	Metadata   map[string]string `json:"metadata,omitempty"`
 }
 
 // SessionEventPayload represents an event from a session.
 type SessionEventPayload struct {
-	SessionID   string                 `json:"session_id,omitempty"`
-	Event       string                 `json:"event,omitempty"`
-	OccurredAt  string                 `json:"occurred_at,omitempty"`
-	Data        map[string]interface{} `json:"data,omitempty"`
+	SessionID  string                 `json:"session_id,omitempty"`
+	Event      string                 `json:"event,omitempty"`
+	OccurredAt string                 `json:"occurred_at,omitempty"`
+	Data       map[string]interface{} `json:"data,omitempty"`
 }
 
 // SessionClosePayload represents a request to close a session.
 type SessionClosePayload struct {
-	SessionID   string `json:"session_id,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
 }
 
 // DelegationStartPayload represents the start of a delegation.
@@ -227,8 +228,8 @@ type DelegationCancelPayload struct {
 
 // DelegationStatusPayload represents the status of a delegation.
 type DelegationStatusPayload struct {
-	DelegationID string                 `json:"delegation_id,omitempty"`
-	Status       string                 `json:"status,omitempty"` // "pending", "in_progress", "completed", "failed", "cancelled"
+	DelegationID string `json:"delegation_id,omitempty"`
+	Status       string `json:"status,omitempty"` // "pending", "in_progress", "completed", "failed", "cancelled"
 }
 
 // DelegationResultPayload represents the result of a delegation.

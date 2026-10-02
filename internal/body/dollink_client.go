@@ -3,7 +3,6 @@
 package body
 
 import (
-	"github.com/mitchellh/mapstructure"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Neon-Dolls/neondoll-shellbody/internal/link"
+	"github.com/google/uuid"
 )
 
 // Transport is the interface for sending and receiving Doll Link messages.
@@ -61,13 +61,13 @@ type Client struct {
 // NewClient creates a new Body client with the given transport and Body ID.
 func NewClient(t Transport, bodyID string) *Client {
 	return &Client{
-		Transport:     t,
-		BodyID:        bodyID,
-		BodyType:      "shell",
+		Transport:      t,
+		BodyID:         bodyID,
+		BodyType:       "shell",
 		Implementation: "neondoll-shellbody",
-		Platform:      "linux",
-		Architecture:  "amd64",
-		done:          make(chan struct{}),
+		Platform:       "linux",
+		Architecture:   "amd64",
+		done:           make(chan struct{}),
 	}
 }
 
@@ -159,26 +159,30 @@ func (c *Client) Run(ctx context.Context) error {
 // negotiateVersions performs the version negotiation handshake.
 func (c *Client) negotiateVersions(ctx context.Context) error {
 	// 1. Send body.hello
-	bodyHello := link.Envelope{
-		Type:    link.TypeBodyHello,
-		ID:      generateID(),
-		BodyID:  c.BodyID,
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		Payload: link.HelloPayload{
-			BodyType:       c.BodyType,
-			Implementation: c.Implementation,
-			Platform:       c.Platform,
-			Architecture:   c.Architecture,
-			DollLink: link.VersionSpec{
-				MinVersion: 1,
-				MaxVersion: 1,
-			},
-			BodyContract: link.VersionSpec{
-				MinVersion: 1,
-				MaxVersion: 1,
-			},
-			Build: 0,
+	payloadBytes, err := json.Marshal(link.HelloPayload{
+		BodyType:       c.BodyType,
+		Implementation: c.Implementation,
+		Platform:       c.Platform,
+		Architecture:   c.Architecture,
+		DollLink: link.VersionSpec{
+			MinVersion: 1,
+			MaxVersion: 1,
 		},
+		BodyContract: link.VersionSpec{
+			MinVersion: 1,
+			MaxVersion: 1,
+		},
+		Build: 0,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to marshal body.hello payload: %w", err)
+	}
+	bodyHello := link.Envelope{
+		Type:      link.TypeBodyHello,
+		ID:        generateID(),
+		BodyID:    c.BodyID,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Payload:   payloadBytes,
 	}
 	if err := c.Transport.Send(ctx, bodyHello); err != nil {
 		return fmt.Errorf("failed to send body.hello: %w", err)
@@ -196,20 +200,8 @@ func (c *Client) negotiateVersions(ctx context.Context) error {
 		DollLinkVersion     int `json:"doll_link_version"`
 		BodyContractVersion int `json:"body_contract_version"`
 	}
-	switch v := resp.Payload.(type) {
-	case map[string]interface{}:
-		if vv, ok := v["doll_link_version"].(float64); ok {
-			coreHelloPayload.DollLinkVersion = int(vv)
-		}
-		if vv, ok := v["body_contract_version"].(float64); ok {
-			coreHelloPayload.BodyContractVersion = int(vv)
-		}
-	case []byte:
-		if err := json.Unmarshal(v, &coreHelloPayload); err != nil {
-			return fmt.Errorf("failed to unmarshal core.hello payload: %w", err)
-		}
-	default:
-		return fmt.Errorf("unexpected core.hello payload type: %T", resp.Payload)
+	if err := json.Unmarshal(resp.Payload, &coreHelloPayload); err != nil {
+		return fmt.Errorf("failed to unmarshal core.hello payload: %w", err)
 	}
 	c.mu.Lock()
 	c.negotiatedVersions.DollLink = coreHelloPayload.DollLinkVersion
@@ -219,20 +211,24 @@ func (c *Client) negotiateVersions(ctx context.Context) error {
 	return nil
 }
 func (c *Client) advertiseCapabilities(ctx context.Context) error {
-	cap := link.Envelope{
-		Type:    link.TypeBodyCapabilities,
-		ID:      generateID(),
-		BodyID:  c.BodyID,
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		Payload: link.CapabilitiesPayload{
-			Capabilities: []link.Capability{
-				{
-					ID:         "terminal",
-					Operations: []string{"input", "output"},
-					Available:  true,
-				},
+	payloadBytes, err := json.Marshal(link.CapabilitiesPayload{
+		Capabilities: []link.Capability{
+			{
+				ID:         "terminal",
+				Operations: []string{"input", "output"},
+				Available:  true,
 			},
 		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to marshal capabilities payload: %w", err)
+	}
+	cap := link.Envelope{
+		Type:      link.TypeBodyCapabilities,
+		ID:        generateID(),
+		BodyID:    c.BodyID,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Payload:   payloadBytes,
 	}
 	if err := c.Transport.Send(ctx, cap); err != nil {
 		return fmt.Errorf("failed to send body.capabilities: %w", err)
@@ -242,12 +238,16 @@ func (c *Client) advertiseCapabilities(ctx context.Context) error {
 
 // sendReady sends body.ready.
 func (c *Client) sendReady(ctx context.Context) error {
+	payloadBytes, err := json.Marshal(link.ReadyPayload{})
+	if err != nil {
+		return fmt.Errorf("failed to marshal ready payload: %w", err)
+	}
 	ready := link.Envelope{
-		Type:    link.TypeBodyReady,
-		ID:      generateID(),
-		BodyID:  c.BodyID,
+		Type:      link.TypeBodyReady,
+		ID:        generateID(),
+		BodyID:    c.BodyID,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		Payload: link.ReadyPayload{},
+		Payload:   payloadBytes,
 	}
 	if err := c.Transport.Send(ctx, ready); err != nil {
 		return fmt.Errorf("failed to send body.ready: %w", err)
@@ -263,7 +263,7 @@ func (c *Client) handleMessage(ctx context.Context, msg *link.Envelope) error {
 	switch msg.Type {
 	case link.TypeExecutionRequest:
 		var req link.ExecutionRequestPayload
-		if err := json.Unmarshal(msg.Payload.([]byte), &req); err != nil {
+		if err := json.Unmarshal(msg.Payload, &req); err != nil {
 			return fmt.Errorf("failed to unmarshal execution.request: %w", err)
 		}
 		c.mu.RLock()
@@ -281,7 +281,12 @@ func (c *Client) handleMessage(ctx context.Context, msg *link.Envelope) error {
 				CorrelationID: msg.ID,
 				BodyID:        c.BodyID,
 				Timestamp:     time.Now().UTC().Format(time.RFC3339),
-				Payload:       res,
+				Payload:       json.RawMessage{},
+			}
+			if marshaled, err := json.Marshal(res); err != nil {
+				return fmt.Errorf("failed to marshal execution.result: %w", err)
+			} else {
+				out.Payload = marshaled
 			}
 			if err := c.Transport.Send(ctx, out); err != nil {
 				return fmt.Errorf("failed to send execution.result: %w", err)
@@ -302,7 +307,12 @@ func (c *Client) handleMessage(ctx context.Context, msg *link.Envelope) error {
 			CorrelationID: msg.ID,
 			BodyID:        c.BodyID,
 			Timestamp:     time.Now().UTC().Format(time.RFC3339),
-			Payload:       res,
+			Payload:       json.RawMessage{},
+		}
+		if marshaled, err := json.Marshal(res); err != nil {
+			return fmt.Errorf("failed to marshal execution.result: %w", err)
+		} else {
+			out.Payload = marshaled
 		}
 		if err := c.Transport.Send(ctx, out); err != nil {
 			return fmt.Errorf("failed to send execution.result: %w", err)
@@ -311,17 +321,8 @@ func (c *Client) handleMessage(ctx context.Context, msg *link.Envelope) error {
 
 	case link.TypeSessionOpen:
 		var req link.SessionOpenPayload
-		switch v := msg.Payload.(type) {
-		case []byte:
-			if err := json.Unmarshal(v, &req); err != nil {
-				return fmt.Errorf("failed to unmarshal session.open: %w", err)
-			}
-		case map[string]interface{}:
-			if err := mapstructure.Decode(v, &req); err != nil {
-				return fmt.Errorf("failed to decode session.open: %w", err)
-			}
-		default:
-			return fmt.Errorf("unexpected session.open payload type: %T", msg.Payload)
+		if err := json.Unmarshal(msg.Payload, &req); err != nil {
+			return fmt.Errorf("failed to unmarshal session.open: %w", err)
 		}
 		c.mu.RLock()
 		h := c.onSessionOpen
@@ -340,7 +341,12 @@ func (c *Client) handleMessage(ctx context.Context, msg *link.Envelope) error {
 			CorrelationID: msg.ID,
 			BodyID:        c.BodyID,
 			Timestamp:     time.Now().UTC().Format(time.RFC3339),
-			Payload:       res,
+			Payload:       json.RawMessage{},
+		}
+		if marshaled, err := json.Marshal(res); err != nil {
+			return fmt.Errorf("failed to marshal session.opened: %w", err)
+		} else {
+			out.Payload = marshaled
 		}
 		if err := c.Transport.Send(ctx, out); err != nil {
 			return fmt.Errorf("failed to send session.opened: %w", err)
@@ -349,7 +355,7 @@ func (c *Client) handleMessage(ctx context.Context, msg *link.Envelope) error {
 
 	case link.TypeBodyEvent:
 		var ev link.EventPayload
-		if err := json.Unmarshal(msg.Payload.([]byte), &ev); err != nil {
+		if err := json.Unmarshal(msg.Payload, &ev); err != nil {
 			return fmt.Errorf("failed to unmarshal body.event: %w", err)
 		}
 		c.mu.RLock()
@@ -376,11 +382,8 @@ func (c *Client) Close() error {
 	return c.Transport.Close()
 }
 
-// generateID creates a simple monotonically increasing ID for demo/testing.
-// In production, we should use a proper unique identifier (e.g., UUID).
-var idCounter int64
-
+// generateID creates a unique ID suitable for production messages.
+// Uses UUID version 4 for uniqueness without coordination.
 func generateID() string {
-	idCounter++
-	return fmt.Sprintf("evt_%d", idCounter)
+	return "evt_" + uuid.NewString()
 }

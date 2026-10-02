@@ -14,7 +14,7 @@ func TestEnvelopeMarshalUnmarshal(t *testing.T) {
 		ID:        "evt_123",
 		BodyID:    "body_abc",
 		Timestamp: "2026-09-23T00:00:00Z",
-		Payload: HelloPayload{
+		Payload: mustMarshal(HelloPayload{
 			BodyType:       "desktop",
 			Implementation: "neondoll-shellbody",
 			Platform:       "linux",
@@ -28,7 +28,7 @@ func TestEnvelopeMarshalUnmarshal(t *testing.T) {
 				MaxVersion: 1,
 			},
 			Build: 1,
-		},
+		}),
 	}
 
 	data, err := json.Marshal(hello)
@@ -55,49 +55,49 @@ func TestEnvelopeMarshalUnmarshal(t *testing.T) {
 		t.Fatalf("Timestamp mismatch: got %v, want %v", got.Timestamp, "2026-09-23T00:00:00Z")
 	}
 
-	// Check payload contents (since Payload is interface{}, it unmarshaled as map[string]interface{})
-	payloadMap, ok := got.Payload.(map[string]interface{})
-	if !ok {
-		t.Fatalf("Payload is not a map: got %T", got.Payload)
+	// Check payload contents by unmarshaling into the expected type
+	var helloPayload HelloPayload
+	if err := json.Unmarshal(got.Payload, &helloPayload); err != nil {
+		t.Fatalf("failed to unmarshal payload into HelloPayload: %v", err)
 	}
-	if payloadMap["body_type"] != "desktop" {
-		t.Fatalf("body_type mismatch: got %v, want desktop", payloadMap["body_type"])
+	if helloPayload.BodyType != "desktop" {
+		t.Fatalf("body_type mismatch: got %v, want desktop", helloPayload.BodyType)
 	}
-	if payloadMap["implementation"] != "neondoll-shellbody" {
-		t.Fatalf("implementation mismatch: got %v, want neondoll-shellbody", payloadMap["implementation"])
+	if helloPayload.Implementation != "neondoll-shellbody" {
+		t.Fatalf("implementation mismatch: got %v, want neondoll-shellbody", helloPayload.Implementation)
 	}
-	if payloadMap["platform"] != "linux" {
-		t.Fatalf("platform mismatch: got %v, want linux", payloadMap["platform"])
+	if helloPayload.Platform != "linux" {
+		t.Fatalf("platform mismatch: got %v, want linux", helloPayload.Platform)
 	}
-	if payloadMap["architecture"] != "amd64" {
-		t.Fatalf("architecture mismatch: got %v, want amd64", payloadMap["architecture"])
+	if helloPayload.Architecture != "amd64" {
+		t.Fatalf("architecture mismatch: got %v, want amd64", helloPayload.Architecture)
 	}
-	if payloadMap["build"] != float64(1) { // JSON numbers unmarshal as float64
-		t.Fatalf("build mismatch: got %v, want 1", payloadMap["build"])
+	if helloPayload.Build != 1 {
+		t.Fatalf("build mismatch: got %v, want 1", helloPayload.Build)
 	}
 
 	// Check nested objects
-	dollLink, ok := payloadMap["doll_link"].(map[string]interface{})
-	if !ok {
-		t.Fatalf("doll_link is not a map: got %T", payloadMap["doll_link"])
+	if helloPayload.DollLink.MinVersion != 1 {
+		t.Fatalf("doll_link.min_version mismatch: got %v, want 1", helloPayload.DollLink.MinVersion)
 	}
-	if dollLink["min_version"] != float64(1) {
-		t.Fatalf("doll_link.min_version mismatch: got %v, want 1", dollLink["min_version"])
+	if helloPayload.DollLink.MaxVersion != 1 {
+		t.Fatalf("doll_link.max_version mismatch: got %v, want 1", helloPayload.DollLink.MaxVersion)
 	}
-	if dollLink["max_version"] != float64(1) {
-		t.Fatalf("doll_link.max_version mismatch: got %v, want 1", dollLink["max_version"])
+	if helloPayload.BodyContract.MinVersion != 1 {
+		t.Fatalf("body_contract.min_version mismatch: got %v, want 1", helloPayload.BodyContract.MinVersion)
 	}
+	if helloPayload.BodyContract.MaxVersion != 1 {
+		t.Fatalf("body_contract.max_version mismatch: got %v, want 1", helloPayload.BodyContract.MaxVersion)
+	}
+}
 
-	bodyContract, ok := payloadMap["body_contract"].(map[string]interface{})
-	if !ok {
-		t.Fatalf("body_contract is not a map: got %T", payloadMap["body_contract"])
+// mustMarshal marshals v and panics on error.
+func mustMarshal(v interface{}) json.RawMessage {
+	data, err := json.Marshal(v)
+	if err != nil {
+		panic(fmt.Sprintf("marshal failed: %v", err))
 	}
-	if bodyContract["min_version"] != float64(1) {
-		t.Fatalf("body_contract.min_version mismatch: got %v, want 1", bodyContract["min_version"])
-	}
-	if bodyContract["max_version"] != float64(1) {
-		t.Fatalf("body_contract.max_version mismatch: got %v, want 1", bodyContract["max_version"])
-	}
+	return data
 }
 
 func TestUnknownMessageType(t *testing.T) {

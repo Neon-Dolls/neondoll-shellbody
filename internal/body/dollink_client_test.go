@@ -17,20 +17,20 @@ import (
 // It uses unbuffered channels to synchronize sends and receives, and
 // marshals/unmarshals Envelopes to/from JSON to simulate the wire format.
 type fakeTransport struct {
-	mu      sync.Mutex
-	sendCh  chan []byte // channel for JSON bytes sent by the client
-	recvCh  chan []byte // channel for JSON bytes to be received by the client
-	sendErr error
-	recvErr error
+	mu       sync.Mutex
+	sendCh   chan []byte // channel for JSON bytes sent by the client
+	recvCh   chan []byte // channel for JSON bytes to be received by the client
+	sendErr  error
+	recvErr  error
 	closeErr error
-	closed  bool
+	closed   bool
 }
 
 // NewFakeTransport creates a fake transport for testing.
 func NewFakeTransport() *fakeTransport {
 	return &fakeTransport{
 		sendCh: make(chan []byte),
-		recvCh:  make(chan []byte),
+		recvCh: make(chan []byte),
 	}
 }
 
@@ -100,18 +100,28 @@ func TestClientNegotiation(t *testing.T) {
 		}
 		// 2. Send core.hello
 		coreHello := link.Envelope{
-			Type:    link.TypeCoreHello,
-			ID:      "evt_core",
-			BodyID:  "test-body-id",
+			Type:      link.TypeCoreHello,
+			ID:        "evt_core",
+			BodyID:    "test-body-id",
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Payload: map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1},
+			Payload:   json.RawMessage{},
 		}
+		if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
+			t.Fatalf("failed to marshal core.hello: %v", err)
+		} else {
+			coreHello.Payload = marshaled
+		}
+			if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
+		t.Fatalf("failed to marshal core.hello: %v", err)
+			} else {
+		coreHello.Payload = marshaled
+			}
 		coreHelloData, err := json.Marshal(coreHello)
 		if err != nil {
 			t.Fatalf("failed to marshal core.hello: %v", err)
 		}
 		ft.recvCh <- coreHelloData
-	}()
+		}()
 
 	// Run client negotiation in a separate goroutine with a cancellable context.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -148,12 +158,22 @@ func TestClientCapabilities(t *testing.T) {
 		}
 		// 2. Send core.hello
 		coreHello := link.Envelope{
-			Type:    link.TypeCoreHello,
-			ID:      "evt_core",
-			BodyID:  "test-body-id",
+			Type:      link.TypeCoreHello,
+			ID:        "evt_core",
+			BodyID:    "test-body-id",
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Payload: map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1},
+			Payload:   json.RawMessage{},
 		}
+		if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
+			t.Fatalf("failed to marshal core.hello: %v", err)
+		} else {
+			coreHello.Payload = marshaled
+		}
+			if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
+		t.Fatalf("failed to marshal core.hello: %v", err)
+			} else {
+		coreHello.Payload = marshaled
+			}
 		coreHelloData, err := json.Marshal(coreHello)
 		if err != nil {
 			t.Fatalf("failed to marshal core.hello: %v", err)
@@ -266,12 +286,22 @@ func TestClientExecutionRequest(t *testing.T) {
 		}
 		// 2. Send core.hello
 		coreHello := link.Envelope{
-			Type:    link.TypeCoreHello,
-			ID:      "evt_core",
-			BodyID:  "test-body-id",
+			Type:      link.TypeCoreHello,
+			ID:        "evt_core",
+			BodyID:    "test-body-id",
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Payload: map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1},
+			Payload:   json.RawMessage{},
 		}
+		if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
+			t.Fatalf("failed to marshal core.hello: %v", err)
+		} else {
+			coreHello.Payload = marshaled
+		}
+			if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
+		t.Fatalf("failed to marshal core.hello: %v", err)
+			} else {
+		coreHello.Payload = marshaled
+			}
 		coreHelloData, err := json.Marshal(coreHello)
 		if err != nil {
 			t.Fatalf("failed to marshal core.hello: %v", err)
@@ -327,12 +357,12 @@ func TestClientExecutionRequest(t *testing.T) {
 		}
 		// 6. Send execution.result
 		execResult := link.Envelope{
-			Type:    link.TypeExecutionResult,
-			ID:      "evt_result",
-			BodyID:  "test-body-id",
-			Timestamp: time.Now().UTC().Format(time.RFC3339),
+			Type:          link.TypeExecutionResult,
+			ID:            "evt_result",
+			BodyID:        "test-body-id",
+			Timestamp:     time.Now().UTC().Format(time.RFC3339),
 			CorrelationID: execReq.ID,
-			Payload: []byte(`{"execution_id":"` + expectedReqID + `","status":"success","result":{"output":"hello"}}`),
+			Payload:       []byte(`{"execution_id":"` + expectedReqID + `","status":"success","result":{"output":"hello"}}`),
 		}
 		execResultData, err := json.Marshal(execResult)
 		if err != nil {
@@ -400,12 +430,22 @@ func TestClientSessionOpen(t *testing.T) {
 		}
 		// 2. Send core.hello
 		coreHello := link.Envelope{
-			Type:    link.TypeCoreHello,
-			ID:      "evt_core",
-			BodyID:  "test-body-id",
+			Type:      link.TypeCoreHello,
+			ID:        "evt_core",
+			BodyID:    "test-body-id",
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Payload: map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1},
+			Payload:   json.RawMessage{},
 		}
+		if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
+			t.Fatalf("failed to marshal core.hello: %v", err)
+		} else {
+			coreHello.Payload = marshaled
+		}
+			if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
+		t.Fatalf("failed to marshal core.hello: %v", err)
+			} else {
+		coreHello.Payload = marshaled
+			}
 		coreHelloData, err := json.Marshal(coreHello)
 		if err != nil {
 			t.Fatalf("failed to marshal core.hello: %v", err)
@@ -432,15 +472,20 @@ func TestClientSessionOpen(t *testing.T) {
 		}
 		// 5. Send session.open
 		sessionOpen := link.Envelope{
-			Type:    link.TypeSessionOpen,
-			ID:      "evt_session_open",
-			BodyID:  "test-body-id",
+			Type:      link.TypeSessionOpen,
+			ID:        "evt_session_open",
+			BodyID:    "test-body-id",
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Payload: link.SessionOpenPayload{
-				LocalSessionID: "local_sess_123",
-				Kind:           "test-kind",
-				Metadata:       map[string]string{"foo": "bar"},
-			},
+			Payload:   json.RawMessage{},
+		}
+		if marshaled, err := json.Marshal(link.SessionOpenPayload{
+			LocalSessionID: "local_sess_123",
+			Kind:           "test-kind",
+			Metadata:       map[string]string{"foo": "bar"},
+		}); err != nil {
+			t.Fatalf("failed to marshal session.open: %v", err)
+		} else {
+			sessionOpen.Payload = marshaled
 		}
 		sessionOpenData, err := json.Marshal(sessionOpen)
 		if err != nil {
@@ -458,7 +503,7 @@ func TestClientSessionOpen(t *testing.T) {
 			t.Fatalf("expected session.opened, got %s", sessionOpened.Type)
 		}
 		var sessionOpenedPayload link.SessionOpenedPayload
-		if err := json.Unmarshal(sessionOpened.Payload.([]byte), &sessionOpenedPayload); err != nil {
+		if err := json.Unmarshal(sessionOpened.Payload, &sessionOpenedPayload); err != nil {
 			t.Fatalf("failed to unmarshal session.opened payload: %v", err)
 		}
 		if sessionOpenedPayload.SessionID != "sess_123" {
@@ -532,12 +577,22 @@ func TestClientBodyEvent(t *testing.T) {
 		}
 		// 2. core.hello
 		coreHello := link.Envelope{
-			Type:    link.TypeCoreHello,
-			ID:      "evt_core",
-			BodyID:  "test-body-id",
+			Type:      link.TypeCoreHello,
+			ID:        "evt_core",
+			BodyID:    "test-body-id",
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Payload: map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1},
+			Payload:   json.RawMessage{},
 		}
+		if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
+			t.Fatalf("failed to marshal core.hello: %v", err)
+		} else {
+			coreHello.Payload = marshaled
+		}
+			if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
+		t.Fatalf("failed to marshal core.hello: %v", err)
+			} else {
+		coreHello.Payload = marshaled
+			}
 		coreHelloData, err := json.Marshal(coreHello)
 		if err != nil {
 			t.Fatalf("failed to marshal core.hello: %v", err)
@@ -646,12 +701,22 @@ func TestClientUnknownMessageType(t *testing.T) {
 		}
 		// 2. core.hello
 		coreHello := link.Envelope{
-			Type:    link.TypeCoreHello,
-			ID:      "evt_core",
-			BodyID:  "test-body-id",
+			Type:      link.TypeCoreHello,
+			ID:        "evt_core",
+			BodyID:    "test-body-id",
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Payload: map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1},
+			Payload:   json.RawMessage{},
 		}
+		if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
+			t.Fatalf("failed to marshal core.hello: %v", err)
+		} else {
+			coreHello.Payload = marshaled
+		}
+			if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
+		t.Fatalf("failed to marshal core.hello: %v", err)
+			} else {
+		coreHello.Payload = marshaled
+			}
 		coreHelloData, err := json.Marshal(coreHello)
 		if err != nil {
 			t.Fatalf("failed to marshal core.hello: %v", err)
@@ -738,11 +803,21 @@ func TestClientReconnectionSameBodyID(t *testing.T) {
 		}
 		// 2. core.hello
 		coreHello := link.Envelope{
-			Type:    link.TypeCoreHello,
-			ID:      "evt_core1",
-			BodyID:  "reconnect-body-id",
+			Type:      link.TypeCoreHello,
+			ID:        "evt_core1",
+			BodyID:    "reconnect-body-id",
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Payload: map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1},
+			Payload:   json.RawMessage{},
+		}
+			if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
+		t.Fatalf("failed to marshal core.hello: %v", err)
+			} else {
+		coreHello.Payload = marshaled
+			}
+		if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
+			t.Fatalf("failed to marshal core.hello: %v", err)
+		} else {
+			coreHello.Payload = marshaled
 		}
 		coreHelloData, err := json.Marshal(coreHello)
 		if err != nil {
@@ -807,11 +882,16 @@ func TestClientReconnectionSameBodyID(t *testing.T) {
 		}
 		// 2. core.hello
 		coreHello := link.Envelope{
-			Type:    link.TypeCoreHello,
-			ID:      "evt_core2",
-			BodyID:  "reconnect-body-id",
+			Type:      link.TypeCoreHello,
+			ID:        "evt_core2",
+			BodyID:    "reconnect-body-id",
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Payload: map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1},
+			Payload:   json.RawMessage{},
+		}
+		if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
+			t.Fatalf("failed to marshal core.hello: %v", err)
+		} else {
+			coreHello.Payload = marshaled
 		}
 		coreHelloData, err := json.Marshal(coreHello)
 		if err != nil {

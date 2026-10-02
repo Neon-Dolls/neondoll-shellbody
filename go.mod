@@ -4,7 +4,6 @@ go 1.25.0
 
 require (
 	github.com/Neon-Dolls/neondoll v0.0.0-20260929143111-717147e73612
-	github.com/mitchellh/mapstructure v1.5.0
 )
 
 require (
