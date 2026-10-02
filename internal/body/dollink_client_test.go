@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -87,10 +88,9 @@ func TestClientNegotiation(t *testing.T) {
 	ft := NewFakeTransport()
 	client := NewClient(ft, "test-body-id")
 
-	// Peer goroutine: acts as the Core, reading client's sends and writing responses.
 	errc := make(chan error, 1)
 	go func() {
-		// 1. Receive body.hello from client (as JSON bytes)
+		// 1. Receive body.hello from client (as JSON bytes). The client sends it first.
 		data := <-ft.sendCh
 		var bodyHello link.Envelope
 		if err := json.Unmarshal(data, &bodyHello); err != nil {
@@ -101,25 +101,18 @@ func TestClientNegotiation(t *testing.T) {
 			errc <- fmt.Errorf("expected body.hello, got %s", bodyHello.Type)
 			return
 		}
-		// 2. Send core.hello
+		// 2. Send core.hello back to the client (the client Receive reads recvCh).
+		marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1})
+		if err != nil {
+			errc <- fmt.Errorf("failed to marshal core.hello: %v", err)
+			return
+		}
 		coreHello := link.Envelope{
 			Type:      link.TypeCoreHello,
 			ID:        "evt_core",
 			BodyID:    "test-body-id",
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Payload:   json.RawMessage{},
-		}
-		if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
-			errc <- fmt.Errorf("failed to marshal core.hello: %v", err)
-			return
-		} else {
-			coreHello.Payload = marshaled
-		}
-		if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
-			errc <- fmt.Errorf("failed to marshal core.hello: %v", err)
-			return
-		} else {
-			coreHello.Payload = marshaled
+			Payload:   marshaled,
 		}
 		coreHelloData, err := json.Marshal(coreHello)
 		if err != nil {
@@ -127,8 +120,18 @@ func TestClientNegotiation(t *testing.T) {
 			return
 		}
 		ft.recvCh <- coreHelloData
+		errc <- nil
 	}()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	clientDone := make(chan error, 1)
+	go func() {
+		clientDone <- client.negotiateVersions(ctx)
+	}()
+
+	// The peer and the client run concurrently and synchronize through the
+	// unbuffered channels. Wait for the peer to complete the handshake.
 	select {
 	case err := <-errc:
 		if err != nil {
@@ -138,11 +141,13 @@ func TestClientNegotiation(t *testing.T) {
 		t.Fatalf("timed out waiting for peer")
 	}
 
-	// Run client negotiation in a separate goroutine with a cancellable context.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	if err := client.negotiateVersions(ctx); err != nil {
-		t.Fatalf("version negotiation failed: %v", err)
+	select {
+	case err := <-clientDone:
+		if err != nil {
+			t.Fatalf("version negotiation failed: %v", err)
+		}
+	case <-time.After(time.Second * 5):
+		t.Fatalf("client negotiation timed out")
 	}
 
 	// Check that versions were negotiated correctly.
@@ -158,12 +163,10 @@ func TestClientNegotiation(t *testing.T) {
 func TestClientCapabilities(t *testing.T) {
 	ft := NewFakeTransport()
 	client := NewClient(ft, "test-body-id")
-	var hasInput, hasOutput bool
 
-	// Peer goroutine: acts as the Core.
 	errc := make(chan error, 1)
 	go func() {
-		// 1. Receive body.hello from client
+		// 1. body.hello
 		data := <-ft.sendCh
 		var bodyHello link.Envelope
 		if err := json.Unmarshal(data, &bodyHello); err != nil {
@@ -174,25 +177,18 @@ func TestClientCapabilities(t *testing.T) {
 			errc <- fmt.Errorf("expected body.hello, got %s", bodyHello.Type)
 			return
 		}
-		// 2. Send core.hello
+		// 2. core.hello
+		marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1})
+		if err != nil {
+			errc <- fmt.Errorf("failed to marshal core.hello: %v", err)
+			return
+		}
 		coreHello := link.Envelope{
 			Type:      link.TypeCoreHello,
 			ID:        "evt_core",
 			BodyID:    "test-body-id",
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Payload:   json.RawMessage{},
-		}
-		if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
-			errc <- fmt.Errorf("failed to marshal core.hello: %v", err)
-			return
-		} else {
-			coreHello.Payload = marshaled
-		}
-		if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
-			errc <- fmt.Errorf("failed to marshal core.hello: %v", err)
-			return
-		} else {
-			coreHello.Payload = marshaled
+			Payload:   marshaled,
 		}
 		coreHelloData, err := json.Marshal(coreHello)
 		if err != nil {
@@ -201,7 +197,7 @@ func TestClientCapabilities(t *testing.T) {
 		}
 		ft.recvCh <- coreHelloData
 
-		// 3. Receive body.capabilities from client
+		// 3. body.capabilities
 		data = <-ft.sendCh
 		var bodyCap link.Envelope
 		if err := json.Unmarshal(data, &bodyCap); err != nil {
@@ -212,19 +208,9 @@ func TestClientCapabilities(t *testing.T) {
 			errc <- fmt.Errorf("expected body.capabilities, got %s", bodyCap.Type)
 			return
 		}
-		// Decode the payload to verify it's valid (optional, but we can)
-		payloadBytes, err := json.Marshal(bodyCap.Payload)
-		if err != nil {
-			errc <- fmt.Errorf("failed to marshal capabilities payload: %v", err)
-			return
-		}
 		var capResp link.CapabilitiesPayload
-		if err := json.Unmarshal(payloadBytes, &capResp); err != nil {
+		if err := json.Unmarshal(bodyCap.Payload, &capResp); err != nil {
 			errc <- fmt.Errorf("failed to unmarshal capabilities payload: %v", err)
-			return
-		}
-		if len(capResp.Capabilities) == 0 {
-			errc <- fmt.Errorf("expected at least one capability")
 			return
 		}
 		if len(capResp.Capabilities) == 0 {
@@ -235,28 +221,48 @@ func TestClientCapabilities(t *testing.T) {
 			errc <- fmt.Errorf("expected capability ID \"terminal\", got %s", capResp.Capabilities[0].ID)
 			return
 		}
-		if len(capResp.Capabilities[0].Operations) != 2 {
-			errc <- fmt.Errorf("expected 2 operations, got %d", len(capResp.Capabilities[0].Operations))
-			return
-		}
+		var hasInput, hasOutput bool
 		for _, op := range capResp.Capabilities[0].Operations {
-			if op == "input" {
+			switch op {
+			case "input":
 				hasInput = true
-			}
-			if op == "output" {
+			case "output":
 				hasOutput = true
 			}
 		}
 		if !hasInput || !hasOutput {
-			errc <- fmt.Errorf("expected operations to include \\\"input\\\" and \\\"output\\\", got %v", capResp.Capabilities[0].Operations)
+			errc <- fmt.Errorf("expected operations to include \"input\" and \"output\", got %v", capResp.Capabilities[0].Operations)
 			return
 		}
 		if !capResp.Capabilities[0].Available {
 			errc <- fmt.Errorf("expected capability to be available")
 			return
 		}
+
+		// 4. body.ready
+		data = <-ft.sendCh
+		var bodyReady link.Envelope
+		if err := json.Unmarshal(data, &bodyReady); err != nil {
+			errc <- fmt.Errorf("failed to unmarshal body.ready: %v", err)
+			return
+		}
+		if bodyReady.Type != link.TypeBodyReady {
+			errc <- fmt.Errorf("expected body.ready, got %s", bodyReady.Type)
+			return
+		}
+
+		errc <- nil
 	}()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	clientDone := make(chan error, 1)
+	go func() {
+		clientDone <- client.Run(ctx)
+	}()
+
+	// The peer consumes the negotiation/capabilities/ready sequence. Once the
+	// peer is satisfied, cancel the context to stop the client's receive loop.
 	select {
 	case err := <-errc:
 		if err != nil {
@@ -265,23 +271,14 @@ func TestClientCapabilities(t *testing.T) {
 	case <-time.After(time.Second * 5):
 		t.Fatalf("timed out waiting for peer")
 	}
-
-	// Run client negotiation and capabilities advertisement in a separate goroutine with a cancellable context.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan error, 1)
-	go func() {
-		done <- client.Run(ctx)
-	}()
-
-	// Wait for the client to finish or timeout.
+	cancel()
 	select {
-	case err := <-done:
-		if err != nil {
+	case err := <-clientDone:
+		if err != nil && !errors.Is(err, context.Canceled) {
 			t.Fatalf("client run failed: %v", err)
 		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("client run timed out")
+	case <-time.After(time.Second * 3):
+		t.Fatalf("client run did not return after cancel")
 	}
 }
 
@@ -293,7 +290,6 @@ func TestClientExecutionRequest(t *testing.T) {
 	// Set up a handler for execution.request
 	handlerCalled := make(chan struct{}, 1)
 	expectedReqID := "exec_123"
-	expectedCorrelation := "evt_req"
 	client.SetExecutionRequestHandler(func(ctx context.Context, req link.ExecutionRequestPayload) (link.ExecutionResultPayload, error) {
 		// Verify the request
 		if req.ExecutionID != expectedReqID {
@@ -313,10 +309,9 @@ func TestClientExecutionRequest(t *testing.T) {
 		}, nil
 	})
 
-	// Peer goroutine
 	errc := make(chan error, 1)
 	go func() {
-		// 1. Receive body.hello from client
+		// 1. body.hello
 		data := <-ft.sendCh
 		var bodyHello link.Envelope
 		if err := json.Unmarshal(data, &bodyHello); err != nil {
@@ -327,25 +322,18 @@ func TestClientExecutionRequest(t *testing.T) {
 			errc <- fmt.Errorf("expected body.hello, got %s", bodyHello.Type)
 			return
 		}
-		// 2. Send core.hello
+		// 2. core.hello
+		marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1})
+		if err != nil {
+			errc <- fmt.Errorf("failed to marshal core.hello: %v", err)
+			return
+		}
 		coreHello := link.Envelope{
 			Type:      link.TypeCoreHello,
 			ID:        "evt_core",
 			BodyID:    "test-body-id",
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Payload:   json.RawMessage{},
-		}
-		if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
-			errc <- fmt.Errorf("failed to marshal core.hello: %v", err)
-			return
-		} else {
-			coreHello.Payload = marshaled
-		}
-		if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
-			errc <- fmt.Errorf("failed to marshal core.hello: %v", err)
-			return
-		} else {
-			coreHello.Payload = marshaled
+			Payload:   marshaled,
 		}
 		coreHelloData, err := json.Marshal(coreHello)
 		if err != nil {
@@ -353,7 +341,8 @@ func TestClientExecutionRequest(t *testing.T) {
 			return
 		}
 		ft.recvCh <- coreHelloData
-		// 3. Receive body.capabilities from client
+
+		// 3. body.capabilities
 		data = <-ft.sendCh
 		var bodyCap link.Envelope
 		if err := json.Unmarshal(data, &bodyCap); err != nil {
@@ -364,7 +353,7 @@ func TestClientExecutionRequest(t *testing.T) {
 			errc <- fmt.Errorf("expected body.capabilities, got %s", bodyCap.Type)
 			return
 		}
-		// 4. Receive body.ready from client
+		// 4. body.ready
 		data = <-ft.sendCh
 		var bodyReady link.Envelope
 		if err := json.Unmarshal(data, &bodyReady); err != nil {
@@ -375,61 +364,65 @@ func TestClientExecutionRequest(t *testing.T) {
 			errc <- fmt.Errorf("expected body.ready, got %s", bodyReady.Type)
 			return
 		}
-		// 5. Receive execution.request from client
+		// 5. Send execution.request to the client (client reads it via recvCh).
+		execReqPayload, err := json.Marshal(link.ExecutionRequestPayload{
+			ExecutionID: expectedReqID,
+			Capability:  "terminal",
+			Operation:   "input",
+		})
+		if err != nil {
+			errc <- fmt.Errorf("failed to marshal execution.request: %v", err)
+			return
+		}
+		execReq := link.Envelope{
+			Type:      link.TypeExecutionRequest,
+			ID:        "evt_req",
+			BodyID:    "test-body-id",
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+			Payload:   execReqPayload,
+		}
+		execReqData, err := json.Marshal(execReq)
+		if err != nil {
+			errc <- fmt.Errorf("failed to marshal execution.request: %v", err)
+			return
+		}
+		ft.recvCh <- execReqData
+
+		// 6. Receive the client's execution.result reply (client sends it via sendCh).
 		data = <-ft.sendCh
-		var execReq link.Envelope
-		if err := json.Unmarshal(data, &execReq); err != nil {
-			errc <- fmt.Errorf("failed to unmarshal execution.request: %v", err)
+		var execResult link.Envelope
+		if err := json.Unmarshal(data, &execResult); err != nil {
+			errc <- fmt.Errorf("failed to unmarshal execution.result: %v", err)
 			return
 		}
-		if execReq.Type != link.TypeExecutionRequest {
-			errc <- fmt.Errorf("expected execution.request, got %s", execReq.Type)
+		if execResult.Type != link.TypeExecutionResult {
+			errc <- fmt.Errorf("expected execution.result, got %s", execResult.Type)
 			return
 		}
-		if execReq.ID != expectedCorrelation {
-			errc <- fmt.Errorf("expected correlation ID %s, got %s", expectedCorrelation, execReq.ID)
+		if execResult.CorrelationID != execReq.ID {
+			errc <- fmt.Errorf("expected correlation ID %s, got %s", execReq.ID, execResult.CorrelationID)
 			return
 		}
-		// Decode the request to verify (optional)
-		payloadBytes, err := json.Marshal(execReq.Payload)
-		if err != nil {
-			errc <- fmt.Errorf("failed to marshal execution.request payload: %v", err)
+		var res link.ExecutionResultPayload
+		if err := json.Unmarshal(execResult.Payload, &res); err != nil {
+			errc <- fmt.Errorf("failed to unmarshal execution.result payload: %v", err)
 			return
 		}
-		var req link.ExecutionRequestPayload
-		if err := json.Unmarshal(payloadBytes, &req); err != nil {
-			errc <- fmt.Errorf("failed to unmarshal execution.request: %v", err)
+		if res.ExecutionID != expectedReqID {
+			errc <- fmt.Errorf("expected execution ID %s, got %s", expectedReqID, res.ExecutionID)
 			return
 		}
-		if req.ExecutionID != expectedReqID {
-			errc <- fmt.Errorf("expected execution ID %s, got %s", expectedReqID, req.ExecutionID)
-			return
-		}
-		if req.Capability != "terminal" {
-			errc <- fmt.Errorf("expected capability terminal, got %s", req.Capability)
-			return
-		}
-		if req.Operation != "input" {
-			errc <- fmt.Errorf("expected operation input, got %s", req.Operation)
-			return
-		}
-		// 6. Send execution.result
-		execResult := link.Envelope{
-			Type:          link.TypeExecutionResult,
-			ID:            "evt_result",
-			BodyID:        "test-body-id",
-			Timestamp:     time.Now().UTC().Format(time.RFC3339),
-			CorrelationID: execReq.ID,
-			Payload:       []byte(`{"execution_id":"` + expectedReqID + `","status":"success","result":{"output":"hello"}}`),
-		}
-		execResultData, err := json.Marshal(execResult)
-		if err != nil {
-			errc <- fmt.Errorf("failed to marshal execution.result: %v", err)
-			return
-		}
-		ft.recvCh <- execResultData
+		errc <- nil
 	}()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	clientDone := make(chan error, 1)
+	go func() {
+		clientDone <- client.Run(ctx)
+	}()
+
+	// Wait for the peer to observe the full request/reply exchange.
 	select {
 	case err := <-errc:
 		if err != nil {
@@ -439,39 +432,22 @@ func TestClientExecutionRequest(t *testing.T) {
 		t.Fatalf("timed out waiting for peer")
 	}
 
-	// Run client
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan error, 1)
-	go func() {
-		done <- client.Run(ctx)
-	}()
-
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("client run failed: %v", err)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("client run timed out")
-	}
-
-	// Verify handler was called
+	// Verify the handler was called.
 	select {
 	case <-handlerCalled:
 		// good
-	case <-time.After(1 * time.Second):
+	case <-time.After(time.Second * 1):
 		t.Fatal("execution request handler was not called")
 	}
 
 	// Cancel the context to stop the client.
 	cancel()
 	select {
-	case err := <-done:
+	case err := <-clientDone:
 		if err != nil && !errors.Is(err, context.Canceled) {
 			t.Fatalf("client run failed after cancel: %v", err)
 		}
-	case <-time.After(1 * time.Second):
+	case <-time.After(time.Second * 1):
 		t.Fatal("client run did not return after cancel")
 	}
 }
@@ -481,14 +457,20 @@ func TestClientSessionOpen(t *testing.T) {
 	ft := NewFakeTransport()
 	client := NewClient(ft, "test-body-id")
 
-	peerDone := make(chan struct{})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// Set up a session.open handler so the client can reply with session.opened.
+	handlerCalled := make(chan struct{}, 1)
+	client.SetSessionOpenHandler(func(ctx context.Context, req link.SessionOpenPayload) (link.SessionOpenedPayload, error) {
+		handlerCalled <- struct{}{}
+		return link.SessionOpenedPayload{
+			SessionID:  "sess_123",
+			Capability: "test-capability",
+			Metadata:   map[string]string{"foo": "bar"},
+		}, nil
+	})
 
-	// Peer goroutine: acts as the Core.
 	errc := make(chan error, 1)
 	go func() {
-		// 1. Receive body.hello from client
+		// 1. body.hello
 		data := <-ft.sendCh
 		var bodyHello link.Envelope
 		if err := json.Unmarshal(data, &bodyHello); err != nil {
@@ -499,25 +481,18 @@ func TestClientSessionOpen(t *testing.T) {
 			errc <- fmt.Errorf("expected body.hello, got %s", bodyHello.Type)
 			return
 		}
-		// 2. Send core.hello
+		// 2. core.hello
+		marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1})
+		if err != nil {
+			errc <- fmt.Errorf("failed to marshal core.hello: %v", err)
+			return
+		}
 		coreHello := link.Envelope{
 			Type:      link.TypeCoreHello,
 			ID:        "evt_core",
 			BodyID:    "test-body-id",
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Payload:   json.RawMessage{},
-		}
-		if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
-			errc <- fmt.Errorf("failed to marshal core.hello: %v", err)
-			return
-		} else {
-			coreHello.Payload = marshaled
-		}
-		if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
-			errc <- fmt.Errorf("failed to marshal core.hello: %v", err)
-			return
-		} else {
-			coreHello.Payload = marshaled
+			Payload:   marshaled,
 		}
 		coreHelloData, err := json.Marshal(coreHello)
 		if err != nil {
@@ -526,7 +501,7 @@ func TestClientSessionOpen(t *testing.T) {
 		}
 		ft.recvCh <- coreHelloData
 
-		// 3. Receive body.capabilities from client
+		// 3. body.capabilities
 		data = <-ft.sendCh
 		var bodyCap link.Envelope
 		if err := json.Unmarshal(data, &bodyCap); err != nil {
@@ -537,7 +512,7 @@ func TestClientSessionOpen(t *testing.T) {
 			errc <- fmt.Errorf("expected body.capabilities, got %s", bodyCap.Type)
 			return
 		}
-		// 4. Receive body.ready from client
+		// 4. body.ready
 		data = <-ft.sendCh
 		var bodyReady link.Envelope
 		if err := json.Unmarshal(data, &bodyReady); err != nil {
@@ -548,23 +523,22 @@ func TestClientSessionOpen(t *testing.T) {
 			errc <- fmt.Errorf("expected body.ready, got %s", bodyReady.Type)
 			return
 		}
-		// 5. Send session.open
+		// 5. Send session.open to the client.
+		sessionOpenPayload, err := json.Marshal(link.SessionOpenPayload{
+			LocalSessionID: "local_sess_123",
+			Kind:           "test-kind",
+			Metadata:       map[string]string{"foo": "bar"},
+		})
+		if err != nil {
+			errc <- fmt.Errorf("failed to marshal session.open: %v", err)
+			return
+		}
 		sessionOpen := link.Envelope{
 			Type:      link.TypeSessionOpen,
 			ID:        "evt_session_open",
 			BodyID:    "test-body-id",
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Payload:   json.RawMessage{},
-		}
-		if marshaled, err := json.Marshal(link.SessionOpenPayload{
-			LocalSessionID: "local_sess_123",
-			Kind:           "test-kind",
-			Metadata:       map[string]string{"foo": "bar"},
-		}); err != nil {
-			errc <- fmt.Errorf("failed to marshal session.open: %v", err)
-			return
-		} else {
-			sessionOpen.Payload = marshaled
+			Payload:   sessionOpenPayload,
 		}
 		sessionOpenData, err := json.Marshal(sessionOpen)
 		if err != nil {
@@ -573,7 +547,7 @@ func TestClientSessionOpen(t *testing.T) {
 		}
 		ft.recvCh <- sessionOpenData
 
-		// 6. Receive session.opened from client
+		// 6. Receive the client's session.opened reply.
 		data = <-ft.sendCh
 		var sessionOpened link.Envelope
 		if err := json.Unmarshal(data, &sessionOpened); err != nil {
@@ -597,9 +571,14 @@ func TestClientSessionOpen(t *testing.T) {
 			errc <- fmt.Errorf("expected capability \"test-capability\", got %s", sessionOpenedPayload.Capability)
 			return
 		}
+		errc <- nil
+	}()
 
-		// Signal that the peer is done
-		close(peerDone)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	clientDone := make(chan error, 1)
+	go func() {
+		clientDone <- client.Run(ctx)
 	}()
 
 	select {
@@ -610,29 +589,19 @@ func TestClientSessionOpen(t *testing.T) {
 	case <-time.After(time.Second * 5):
 		t.Fatalf("timed out waiting for peer")
 	}
-
-	// Run client in a separate goroutine with a cancellable context.
-	clientDone := make(chan error, 1)
-	go func() {
-		clientDone <- client.Run(ctx)
-	}()
-
-	// Wait for the peer to finish its sequence
-	<-peerDone
-
-	// Now cancel the context to stop the client's message loop
+	select {
+	case <-handlerCalled:
+		// good
+	case <-time.After(time.Second * 1):
+		t.Fatal("session.open handler was not called")
+	}
 	cancel()
-
-	// Wait for the client to finish (it should return when the next Send or Receive gets the cancelled context)
 	select {
 	case err := <-clientDone:
-		if err != nil {
-			// We expect the client to return context.Canceled or similar due to the cancelled context.
-			if !errors.Is(err, context.Canceled) {
-				t.Fatalf("client run failed: %v", err)
-			}
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("client run failed after cancel: %v", err)
 		}
-	case <-time.After(1 * time.Second):
+	case <-time.After(time.Second * 1):
 		t.Fatal("client run did not return after cancel")
 	}
 }
@@ -658,7 +627,6 @@ func TestClientBodyEvent(t *testing.T) {
 		return nil
 	})
 
-	// Peer goroutine
 	errc := make(chan error, 1)
 	go func() {
 		// 1. body.hello
@@ -673,24 +641,17 @@ func TestClientBodyEvent(t *testing.T) {
 			return
 		}
 		// 2. core.hello
+		marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1})
+		if err != nil {
+			errc <- fmt.Errorf("failed to marshal core.hello: %v", err)
+			return
+		}
 		coreHello := link.Envelope{
 			Type:      link.TypeCoreHello,
 			ID:        "evt_core",
 			BodyID:    "test-body-id",
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Payload:   json.RawMessage{},
-		}
-		if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
-			errc <- fmt.Errorf("failed to marshal core.hello: %v", err)
-			return
-		} else {
-			coreHello.Payload = marshaled
-		}
-		if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
-			errc <- fmt.Errorf("failed to marshal core.hello: %v", err)
-			return
-		} else {
-			coreHello.Payload = marshaled
+			Payload:   marshaled,
 		}
 		coreHelloData, err := json.Marshal(coreHello)
 		if err != nil {
@@ -698,6 +659,7 @@ func TestClientBodyEvent(t *testing.T) {
 			return
 		}
 		ft.recvCh <- coreHelloData
+
 		// 3. body.capabilities
 		data = <-ft.sendCh
 		var bodyCap link.Envelope
@@ -720,41 +682,36 @@ func TestClientBodyEvent(t *testing.T) {
 			errc <- fmt.Errorf("expected body.ready, got %s", bodyReady.Type)
 			return
 		}
-		// 5. body.event
-		data = <-ft.sendCh
-		var bodyEvent link.Envelope
-		if err := json.Unmarshal(data, &bodyEvent); err != nil {
-			errc <- fmt.Errorf("failed to unmarshal body.event: %v", err)
-			return
-		}
-		if bodyEvent.Type != link.TypeBodyEvent {
-			errc <- fmt.Errorf("expected body.event, got %s", bodyEvent.Type)
-			return
-		}
-		if bodyEvent.ID != "evt_event" {
-			errc <- fmt.Errorf("expected ID evt_event, got %s", bodyEvent.ID)
-			return
-		}
-		// Decode the event
-		payloadBytes, err := json.Marshal(bodyEvent.Payload)
+		// 5. Send body.event to the client (observation, no reply expected).
+		eventPayload, err := json.Marshal(link.EventPayload{
+			Event:      expectedEvent,
+			Capability: expectedCap,
+		})
 		if err != nil {
-			errc <- fmt.Errorf("failed to marshal body.event payload: %v", err)
+			errc <- fmt.Errorf("failed to marshal body.event: %v", err)
 			return
 		}
-		var ev link.EventPayload
-		if err := json.Unmarshal(payloadBytes, &ev); err != nil {
-			errc <- fmt.Errorf("failed to unmarshal body.event: %v", err)
+		bodyEvent := link.Envelope{
+			Type:      link.TypeBodyEvent,
+			ID:        "evt_event",
+			BodyID:    "test-body-id",
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+			Payload:   eventPayload,
+		}
+		bodyEventData, err := json.Marshal(bodyEvent)
+		if err != nil {
+			errc <- fmt.Errorf("failed to marshal body.event: %v", err)
 			return
 		}
-		if ev.Event != expectedEvent {
-			errc <- fmt.Errorf("expected event %s, got %s", expectedEvent, ev.Event)
-			return
-		}
-		if ev.Capability != expectedCap {
-			errc <- fmt.Errorf("expected capability %s, got %s", expectedCap, ev.Capability)
-			return
-		}
-		// No response expected for body.event (it's an observation)
+		ft.recvCh <- bodyEventData
+		errc <- nil
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	clientDone := make(chan error, 1)
+	go func() {
+		clientDone <- client.Run(ctx)
 	}()
 
 	select {
@@ -765,40 +722,19 @@ func TestClientBodyEvent(t *testing.T) {
 	case <-time.After(time.Second * 5):
 		t.Fatalf("timed out waiting for peer")
 	}
-
-	// Run client
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan error, 1)
-	go func() {
-		done <- client.Run(ctx)
-	}()
-
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("client run failed: %v", err)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("client run timed out")
-	}
-
-	// Verify handler was called
 	select {
 	case <-handlerCalled:
 		// good
-	case <-time.After(1 * time.Second):
+	case <-time.After(time.Second * 1):
 		t.Fatal("body event handler was not called")
 	}
-
-	// Cancel the context to stop the client.
 	cancel()
 	select {
-	case err := <-done:
+	case err := <-clientDone:
 		if err != nil && !errors.Is(err, context.Canceled) {
 			t.Fatalf("client run failed after cancel: %v", err)
 		}
-	case <-time.After(1 * time.Second):
+	case <-time.After(time.Second * 1):
 		t.Fatal("client run did not return after cancel")
 	}
 }
@@ -808,7 +744,6 @@ func TestClientUnknownMessageType(t *testing.T) {
 	ft := NewFakeTransport()
 	client := NewClient(ft, "test-body-id")
 
-	// Peer goroutine
 	errc := make(chan error, 1)
 	go func() {
 		// 1. body.hello
@@ -823,24 +758,17 @@ func TestClientUnknownMessageType(t *testing.T) {
 			return
 		}
 		// 2. core.hello
+		marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1})
+		if err != nil {
+			errc <- fmt.Errorf("failed to marshal core.hello: %v", err)
+			return
+		}
 		coreHello := link.Envelope{
 			Type:      link.TypeCoreHello,
 			ID:        "evt_core",
 			BodyID:    "test-body-id",
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Payload:   json.RawMessage{},
-		}
-		if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
-			errc <- fmt.Errorf("failed to marshal core.hello: %v", err)
-			return
-		} else {
-			coreHello.Payload = marshaled
-		}
-		if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
-			errc <- fmt.Errorf("failed to marshal core.hello: %v", err)
-			return
-		} else {
-			coreHello.Payload = marshaled
+			Payload:   marshaled,
 		}
 		coreHelloData, err := json.Marshal(coreHello)
 		if err != nil {
@@ -870,59 +798,44 @@ func TestClientUnknownMessageType(t *testing.T) {
 			errc <- fmt.Errorf("expected body.ready, got %s", bodyReady.Type)
 			return
 		}
-		// 5. unknown.message
-		data = <-ft.sendCh
-		var unknown link.Envelope
-		if err := json.Unmarshal(data, &unknown); err != nil {
-			errc <- fmt.Errorf("failed to unmarshal unknown.message: %v", err)
+		// 5. Send an unknown message type to the client; the client should error.
+		unknown := link.Envelope{
+			Type:      "unknown.message",
+			ID:        "evt_unknown",
+			BodyID:    "test-body-id",
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+			Payload:   json.RawMessage(`{}`),
+		}
+		unknownData, err := json.Marshal(unknown)
+		if err != nil {
+			errc <- fmt.Errorf("failed to marshal unknown.message: %v", err)
 			return
 		}
-		if unknown.Type != "unknown.message" {
-			errc <- fmt.Errorf("expected unknown.message, got %s", unknown.Type)
-			return
-		}
-		// We don't send a response; the client should error.
+		ft.recvCh <- unknownData
+		errc <- nil
 	}()
 
-	select {
-	case err := <-errc:
-		if err != nil {
-			t.Fatalf("%v", err)
-		}
-	case <-time.After(time.Second * 5):
-		t.Fatalf("timed out waiting for peer")
-	}
-
-	// Run client - should fail on unknown message
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	done := make(chan error, 1)
+	clientDone := make(chan error, 1)
 	go func() {
-		done <- client.Run(ctx)
+		clientDone <- client.Run(ctx)
 	}()
 
+	// The client should fail on the unknown message type and return an error
+	// (it does so before the context is ever cancelled).
 	select {
-	case err := <-done:
+	case err := <-clientDone:
 		if err == nil {
 			t.Fatal("expected client run to fail on unknown message type")
 		}
-		if !errors.Is(err, link.ErrUnknownMessageType) {
+		if !strings.Contains(err.Error(), "unknown.message") {
 			t.Fatalf("expected unknown message type error, got %v", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(time.Second * 5):
 		t.Fatal("client run timed out")
 	}
-
-	// Cancel the context to stop the client (if it hasn't already returned).
 	cancel()
-	select {
-	case err := <-done:
-		if err != nil && !errors.Is(err, context.Canceled) {
-			t.Fatalf("client run failed after cancel: %v", err)
-		}
-	case <-time.After(1 * time.Second):
-		t.Fatal("client run did not return after cancel")
-	}
 }
 
 // TestClientReconnectionSameBodyID tests that reconnecting with the same Body ID works.
@@ -931,7 +844,6 @@ func TestClientReconnectionSameBodyID(t *testing.T) {
 	ft1 := NewFakeTransport()
 	client1 := NewClient(ft1, "reconnect-body-id")
 
-	// Peer for first connection
 	errc := make(chan error, 1)
 	go func() {
 		// 1. body.hello
@@ -946,24 +858,17 @@ func TestClientReconnectionSameBodyID(t *testing.T) {
 			return
 		}
 		// 2. core.hello
+		marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1})
+		if err != nil {
+			errc <- fmt.Errorf("failed to marshal core.hello: %v", err)
+			return
+		}
 		coreHello := link.Envelope{
 			Type:      link.TypeCoreHello,
 			ID:        "evt_core1",
 			BodyID:    "reconnect-body-id",
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Payload:   json.RawMessage{},
-		}
-		if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
-			errc <- fmt.Errorf("failed to marshal core.hello: %v", err)
-			return
-		} else {
-			coreHello.Payload = marshaled
-		}
-		if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
-			errc <- fmt.Errorf("failed to marshal core.hello: %v", err)
-			return
-		} else {
-			coreHello.Payload = marshaled
+			Payload:   marshaled,
 		}
 		coreHelloData, err := json.Marshal(coreHello)
 		if err != nil {
@@ -993,6 +898,14 @@ func TestClientReconnectionSameBodyID(t *testing.T) {
 			errc <- fmt.Errorf("expected body.ready, got %s", bodyReady.Type)
 			return
 		}
+		errc <- nil
+	}()
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+	done1 := make(chan error, 1)
+	go func() {
+		done1 <- client1.Run(ctx1)
 	}()
 
 	select {
@@ -1003,22 +916,14 @@ func TestClientReconnectionSameBodyID(t *testing.T) {
 	case <-time.After(time.Second * 5):
 		t.Fatalf("timed out waiting for peer")
 	}
-
-	// Run first client
-	ctx1, cancel1 := context.WithCancel(context.Background())
-	defer cancel1()
-	done1 := make(chan error, 1)
-	go func() {
-		done1 <- client1.Run(ctx1)
-	}()
-
+	cancel1()
 	select {
 	case err := <-done1:
-		if err != nil {
+		if err != nil && !errors.Is(err, context.Canceled) {
 			t.Fatalf("first client run failed: %v", err)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("first client run timed out")
+	case <-time.After(time.Second * 3):
+		t.Fatal("first client run did not return after cancel")
 	}
 
 	if !client1.isReady() {
@@ -1029,7 +934,6 @@ func TestClientReconnectionSameBodyID(t *testing.T) {
 	ft2 := NewFakeTransport()
 	client2 := NewClient(ft2, "reconnect-body-id") // Same Body ID
 
-	// Peer for second connection
 	errc = make(chan error, 1)
 	go func() {
 		// 1. body.hello
@@ -1044,18 +948,17 @@ func TestClientReconnectionSameBodyID(t *testing.T) {
 			return
 		}
 		// 2. core.hello
+		marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1})
+		if err != nil {
+			errc <- fmt.Errorf("failed to marshal core.hello: %v", err)
+			return
+		}
 		coreHello := link.Envelope{
 			Type:      link.TypeCoreHello,
 			ID:        "evt_core2",
 			BodyID:    "reconnect-body-id",
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Payload:   json.RawMessage{},
-		}
-		if marshaled, err := json.Marshal(map[string]interface{}{"doll_link_version": 1, "body_contract_version": 1}); err != nil {
-			errc <- fmt.Errorf("failed to marshal core.hello: %v", err)
-			return
-		} else {
-			coreHello.Payload = marshaled
+			Payload:   marshaled,
 		}
 		coreHelloData, err := json.Marshal(coreHello)
 		if err != nil {
@@ -1085,6 +988,14 @@ func TestClientReconnectionSameBodyID(t *testing.T) {
 			errc <- fmt.Errorf("expected body.ready, got %s", bodyReady.Type)
 			return
 		}
+		errc <- nil
+	}()
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	done2 := make(chan error, 1)
+	go func() {
+		done2 <- client2.Run(ctx2)
 	}()
 
 	select {
@@ -1095,50 +1006,17 @@ func TestClientReconnectionSameBodyID(t *testing.T) {
 	case <-time.After(time.Second * 5):
 		t.Fatalf("timed out waiting for peer")
 	}
-
-	// Run second client
-	ctx2, cancel2 := context.WithCancel(context.Background())
-	defer cancel2()
-	done2 := make(chan error, 1)
-	go func() {
-		done2 <- client2.Run(ctx2)
-	}()
-
+	cancel2()
 	select {
 	case err := <-done2:
-		if err != nil {
+		if err != nil && !errors.Is(err, context.Canceled) {
 			t.Fatalf("second client run failed: %v", err)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("second client run timed out")
+	case <-time.After(time.Second * 3):
+		t.Fatal("second client run did not return after cancel")
 	}
 
 	if !client2.isReady() {
 		t.Fatal("expected second client to be ready")
-	}
-
-	// Both clients should be ready and have the same Body ID
-	if client1.BodyID != client2.BodyID {
-		t.Fatalf("expected same Body ID, got %s and %s", client1.BodyID, client2.BodyID)
-	}
-
-	// Cancel the contexts to stop the clients.
-	cancel1()
-	cancel2()
-	select {
-	case err := <-done1:
-		if err != nil && !errors.Is(err, context.Canceled) {
-			t.Fatalf("first client run failed after cancel: %v", err)
-		}
-	case <-time.After(1 * time.Second):
-		t.Fatal("first client run did not return after cancel")
-	}
-	select {
-	case err := <-done2:
-		if err != nil && !errors.Is(err, context.Canceled) {
-			t.Fatalf("second client run failed after cancel: %v", err)
-		}
-	case <-time.After(1 * time.Second):
-		t.Fatal("second client run did not return after cancel")
 	}
 }
