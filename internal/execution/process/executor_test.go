@@ -141,3 +141,61 @@ func TestExecutorCommandNotFound(t *testing.T) {
 		t.Fatalf("Expected error, got nil")
 	}
 }
+
+// TestExecutorParentContextCancellation tests that Executor respects parent context cancellation
+func TestExecutorParentContextCancellation(t *testing.T) {
+	e := NewExecutor()
+	// Create a parent context that we can cancel
+	parentCtx, cancel := context.WithCancel(context.Background())
+	
+	// Channel to receive the result
+	resultChan := make(chan struct {
+		exitCode int
+		stdout   string
+		stderr   string
+		err      error
+	}, 1)
+	
+	// Start the Execute call in a goroutine
+	go func() {
+		exitCode, stdout, stderr, err := e.Execute(parentCtx, "sleep", []string{"10"}, []string{}, "", "", 0)
+		resultChan <- struct {
+			exitCode int
+			stdout   string
+			stderr   string
+			err      error
+		}{exitCode, stdout, stderr, err}
+	}()
+	
+	// Wait a bit to ensure the process has started
+	time.Sleep(100 * time.Millisecond)
+	
+	// Cancel the parent context
+	cancel()
+	
+	// Wait for the result
+	select {
+	case result := <-resultChan:
+		// Execute should return promptly due to context cancellation
+		if result.err == nil {
+			t.Fatalf("Expected error due to context cancellation, got none")
+		}
+		// Should return exit code -1 for context cancellation
+		if result.exitCode != -1 {
+			t.Fatalf("Expected exit code -1 for context cancellation, got %d", result.exitCode)
+		}
+		// Error should be context.Canceled
+		if result.err != context.Canceled {
+			t.Fatalf("Expected error to be context.Canceled, got %v", result.err)
+		}
+		// Output should be empty since process was killed quickly
+		if result.stdout != "" {
+			t.Fatalf("Expected empty stdout, got %q", result.stdout)
+		}
+		if result.stderr != "" {
+			t.Fatalf("Expected empty stderr, got %q", result.stderr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Timed out waiting for Execute to return")
+	}
+}

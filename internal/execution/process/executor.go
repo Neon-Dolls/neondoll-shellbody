@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// Executor handles process execution for the shell capability
+// Executor provides wire-independent host process execution machinery.
 type Executor struct{}
 
 // NewExecutor creates a new process executor.
