@@ -96,3 +96,76 @@ removed from this client and which this milestone must not introduce.
   type should be added to close the gap. This milestone stops at negotiation +
   capability advertisement (`body.hello`/`core.hello`/`body.capabilities`/
   `body.ready`), which the public protocol defines cleanly.
+
+## M5 — process capability contract hole
+
+**Date:** 2026-10-03 (M5 investigation)
+**Files consulted (public specs only):** `body-contract.md`, `body-protocol.md` (v1)
+
+**Question investigated:** does the public Body Protocol canonically define the process capability's operations and operation-specific request/result schema for host shell execution?
+
+**Result: protocol hole.** The public specification names "process" as a preferred capability identifier but does NOT define:
+- Any canonical operations for the process capability (e.g. "run")
+- How command/argument representation maps to execution.request.Arguments
+- How "env", "dir", "stdin", and timeout map to process execution
+- Process-specific result semantics (exit code, stdout/stderr handling)
+
+Therefore "process/run" is NOT a canonical wire contract. An independent Body cannot interoperably expose host process execution without inventing semantics.
+
+### Why
+
+The authoritative frozen wire vocabulary is **Body Protocol v1** (`body-protocol.md`). While it lists "process" as a preferred capability in the capabilities advertisement example, it does not define:
+- What operations the process capability supports
+- What request/result schema those operations use
+- Whether execution.request/result should be used for process execution (or if a different mechanism is intended)
+
+The execution.request/result framework exists in the protocol but is not explicitly tied to the process capability in the public specification.
+
+### Consequence for the Shell Body
+
+- The process capability **can be advertised** (the identifier "process" is canonical)
+- But **no wire-compatible operation or payload** is defined for it in the public protocol
+- To implement M5 without inventing a private contract:
+  - Keep the internal process executor as local implementation machinery (internal/execution/process)
+  - Do NOT advertise "process/run" via body.capabilities
+  - Do NOT interpret execution.request as process/run
+  - Do NOT map execution.request.Arguments to process execution fields
+  - The Body-side implementation machinery remains but is deliberately not wired to the protocol
+
+This is distinct from the M4 Interaction Session hole (which concerns terminal I/O). M5 is blocked on process capability contract definition, not interaction session semantics.
+
+M5 wire integration is blocked until the process capability's operations and operation-specific request/result schema are canonicalized in the public specification.
+
+
+## M5 — host process execution capability contract hole
+
+**Date:** 2026-10-03
+**Files consulted (public specs only):** `body-protocol.md` (v1)
+No Core internals used as authority.
+
+**Question investigated:** can the CURRENT public Body/Doll Link protocol express the Shell Body's host process execution capability — Core requesting the Body to run arbitrary shell commands — without inventing semantics for the process capability's operations or request/result schema?
+
+**Result: protocol hole.** NO — while the public protocol canonically names the "process" capability, it does NOT currently define:
+
+- operation "run" (or any other process-specific operations)
+- how command/arguments are represented in execution.request
+- how "env", "dir", "stdin", and timeout map to process execution
+- process-specific result semantics (exit code, stdout, stderr representation)
+
+Therefore "process/run" is NOT currently a canonical wire contract.
+
+### Why
+
+The authoritative frozen wire vocabulary is **Body Protocol v1** (`body-protocol.md`), whose canonical sender rules define the `execution.request`/`execution.result` message pair but do not specify capability-specific semantics for the "process" capability. The public specification only reserves the capability identifier "process" in the preferred capabilities list without defining what operations it supports or what data structures should be used for requests and results.
+
+### Consequence for the Shell Body
+
+- The `internal/execution/process` package provides a wire-independent implementation machinery for host process execution that can be used internally by the Body.
+- However, the Body cannot interoperably expose host process execution over Doll Link without inventing semantics, because:
+  - There is no canonical definition of what operations the "process" capability supports
+  - There is no canonical definition of how to encode process execution requests/results in the generic `execution.request`/`execution.result` framework
+  - Any specific mapping (like "process/run" with command/arguments/env/etc.) would be an invention rather than following the canonical protocol
+
+M5 wire integration is blocked until that capability contract is canonicalized in the public specifications. This is distinct from the M4 Interaction Session hole, which concerns bidirectional terminal text transfer rather than host process execution.
+
+The Body-side implementation machinery in `internal/execution/process` remains as standalone, testable Go code that does not depend on invented Doll Link semantics.
