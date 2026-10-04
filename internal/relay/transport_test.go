@@ -1,10 +1,16 @@
 package relay_test
 
 import (
+	"bytes"
+	"encoding/binary"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/Neon-Dolls/neondoll-shellbody/internal/relay"
+	"golang.org/x/net/websocket"
 )
 
 // TestUDPTransportRoundtrip tests UDP transport Write and Read with real UDP sockets.
@@ -110,6 +116,162 @@ func TestUDPTransportRoundtrip(t *testing.T) {
 	}
 	if !equalBytes(readBuf[:readN], testPacket2) {
 		t.Errorf("Read returned wrong data: got %x, want %x", readBuf[:readN], testPacket2)
+	}
+}
+
+// TestWSSTransportWrite tests that WSSTransport.Write sends a valid frame to a WebSocket server.
+func TestWSSTransportWrite(t *testing.T) {
+	// Define test data
+	routeID := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	payloadA := []byte{0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe}
+
+	// Channel to receive the payload from the WebSocket server
+	received := make(chan []byte, 1)
+	// Set up WebSocket server using httptest
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Upgrade") != "websocket" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		ws := websocket.Server{
+			Handler: func(wsConn *websocket.Conn) {
+				var buf = make([]byte, 4096)
+				n, err := wsConn.Read(buf)
+				if err != nil || n == 0 {
+					return
+				}
+				buf = buf[:n]
+				if len(buf) < 4+16+2 {
+					return
+				}
+				if buf[0] != 0x00 || buf[1] != 0x00 || buf[2] != 0x00 || buf[3] != 0x01 {
+					return
+				}
+				var receivedRouteID [16]byte
+				copy(receivedRouteID[:], buf[4:4+16])
+				if receivedRouteID != routeID {
+					return
+				}
+				packetLen := binary.BigEndian.Uint16(buf[4+16 : 4+16+2])
+				expectedTotal := 4 + 16 + 2 + int(packetLen)
+				if len(buf) != expectedTotal {
+					return
+				}
+				receivedPayload := buf[4+16+2 : 4+16+2+packetLen]
+				received <- receivedPayload
+			},
+			Handshake: func(c *websocket.Config, req *http.Request) error { return nil },
+		}
+		ws.ServeHTTP(w, r)
+	}))
+	ts.Start()
+	defer ts.Close()
+
+	// Create the WSSTransport
+	wsURL := ts.URL
+	if len(wsURL) >= 5 && wsURL[:5] == "http:" {
+		wsURL = "ws:" + wsURL[5:]
+	}
+	transport, err := relay.NewWSSTransport(wsURL, routeID, "http://localhost")
+	if err != nil {
+		t.Fatalf("failed to create WSS transport: %v", err)
+	}
+	defer transport.Close()
+
+	// Write the payload
+	n, err := transport.Write(payloadA)
+	if err != nil {
+		t.Fatalf("transport.Write failed: %v", err)
+	}
+	if n != len(payloadA) {
+		t.Fatalf("transport.Write wrote %d bytes, expected %d", n, len(payloadA))
+	}
+
+	// Wait for the server to receive and validate
+	select {
+	case receivedPayload, ok := <-received:
+		if !ok {
+			t.Fatalf("receiver channel closed unexpectedly")
+		}
+		if !bytes.Equal(receivedPayload, payloadA) {
+			t.Fatalf("server received wrong payload: expected %x, got %x", payloadA, receivedPayload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for server to receive frame")
+	}
+}
+
+// TestWSSTransportRead tests that WSSTransport.Read can read a valid frame from a WebSocket server.
+func TestWSSTransportRead(t *testing.T) {
+	// Define test data
+	routeID := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	payloadB := []byte{0x11, 0x22, 0x33, 0x44}
+
+	// Channel to know when the server has sent the frame
+	sent := make(chan struct{}, 1)
+	// Set up WebSocket server using httptest
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Upgrade") != "websocket" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		ws := websocket.Server{
+			Handler: func(wsConn *websocket.Conn) {
+				// Create a frame to send
+				testFrame := &relay.PacketFrame{
+					Version:   [4]byte{0, 0, 0, 1},
+					RouteID:   routeID,
+					PacketLen: uint16(len(payloadB)),
+					WireGuard: payloadB,
+				}
+				testBinary, err := testFrame.MarshalBinary()
+				if err != nil {
+					return
+				}
+				// Send the frame
+				if _, err = wsConn.Write(testBinary); err != nil {
+					return
+				}
+				// Signal that we've sent the frame
+				close(sent)
+			},
+			Handshake: func(c *websocket.Config, req *http.Request) error { return nil },
+		}
+		ws.ServeHTTP(w, r)
+	}))
+	ts.Start()
+	defer ts.Close()
+
+	// Create the WSSTransport
+	wsURL := ts.URL
+	if len(wsURL) >= 5 && wsURL[:5] == "http:" {
+		wsURL = "ws:" + wsURL[5:]
+	}
+	transport, err := relay.NewWSSTransport(wsURL, routeID, "http://localhost")
+	if err != nil {
+		t.Fatalf("failed to create WSS transport: %v", err)
+	}
+	defer transport.Close()
+
+	// Wait for the server to send the frame
+	select {
+	case <-sent:
+		// Server has sent the frame, now we can read it
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for server to send frame")
+	}
+
+	// Read via transport
+	readBuf := make([]byte, len(payloadB))
+	n, err := transport.Read(readBuf)
+	if err != nil {
+		t.Fatalf("transport.Read failed: %v", err)
+	}
+	if n != len(payloadB) {
+		t.Fatalf("transport.Read read %d bytes, expected %d", n, len(payloadB))
+	}
+	if !bytes.Equal(readBuf[:n], payloadB) {
+		t.Fatalf("transport.Read data mismatch: expected %x, got %x", payloadB, readBuf[:n])
 	}
 }
 
