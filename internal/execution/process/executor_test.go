@@ -147,7 +147,7 @@ func TestExecutorParentContextCancellation(t *testing.T) {
 	e := NewExecutor()
 	// Create a parent context that we can cancel
 	parentCtx, cancel := context.WithCancel(context.Background())
-	
+
 	// Channel to receive the result
 	resultChan := make(chan struct {
 		exitCode int
@@ -155,7 +155,7 @@ func TestExecutorParentContextCancellation(t *testing.T) {
 		stderr   string
 		err      error
 	}, 1)
-	
+
 	// Start the Execute call in a goroutine
 	go func() {
 		exitCode, stdout, stderr, err := e.Execute(parentCtx, "sleep", []string{"10"}, []string{}, "", "", 0)
@@ -166,13 +166,13 @@ func TestExecutorParentContextCancellation(t *testing.T) {
 			err      error
 		}{exitCode, stdout, stderr, err}
 	}()
-	
+
 	// Wait a bit to ensure the process has started
 	time.Sleep(100 * time.Millisecond)
-	
+
 	// Cancel the parent context
 	cancel()
-	
+
 	// Wait for the result
 	select {
 	case result := <-resultChan:
