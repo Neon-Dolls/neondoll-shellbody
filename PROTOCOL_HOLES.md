@@ -96,3 +96,44 @@ removed from this client and which this milestone must not introduce.
   type should be added to close the gap. This milestone stops at negotiation +
   capability advertisement (`body.hello`/`core.hello`/`body.capabilities`/
   `body.ready`), which the public protocol defines cleanly.
+
+## M5 — process capability contract hole
+
+**Date:** 2026-10-03 (M5 investigation)
+**Files consulted (public specs only):** `body-contract.md`, `body-protocol.md` (v1)
+
+**Question investigated:** does the public Body Protocol canonically define the process capability's operations and operation-specific request/result schema for host shell execution?
+
+**Result: protocol hole.** The public specification names "process" as a preferred capability identifier but does NOT define:
+- Any canonical operations for the process capability (e.g. "run")
+- How command/argument representation maps to execution.request.Arguments
+- How "env", "dir", "stdin", and timeout map to process execution
+- Process-specific result semantics (exit code, stdout/stderr handling)
+
+Therefore "process/run" is NOT a canonical wire contract. An independent Body cannot interoperably expose host process execution without inventing semantics.
+
+### Why
+
+The authoritative frozen wire vocabulary is **Body Protocol v1** (`body-protocol.md`). While it lists "process" as a preferred capability in the capabilities advertisement example, it does not define:
+- What operations the process capability supports
+- What request/result schema those operations use
+- Whether execution.request/result should be used for process execution (or if a different mechanism is intended)
+
+The execution.request/result framework exists in the protocol but is not explicitly tied to the process capability in the public specification.
+
+### Consequence for the Shell Body
+
+- The process capability **can be advertised** (the identifier "process" is canonical)
+- But **no wire-compatible operation or payload** is defined for it in the public protocol
+- To implement M5 without inventing a private contract:
+  - Keep the internal process executor as local implementation machinery (internal/execution/process)
+  - Do NOT advertise "process/run" via body.capabilities
+  - Do NOT interpret execution.request as process/run
+  - Do NOT map execution.request.Arguments to process execution fields
+  - The Body-side implementation machinery remains but is deliberately not wired to the protocol
+
+This is distinct from the M4 Interaction Session hole (which concerns terminal I/O). M5 is blocked on process capability contract definition, not interaction session semantics.
+
+M5 wire integration is blocked until the process capability's operations and operation-specific request/result schema are canonicalized in the public specification.
+
+
