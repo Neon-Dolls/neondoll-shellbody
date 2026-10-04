@@ -136,9 +136,6 @@ This is distinct from the M4 Interaction Session hole (which concerns terminal I
 
 M5 wire integration is blocked until the process capability's operations and operation-specific request/result schema are canonicalized in the public specification.
 
-
-
-
 ## M6 — Relay connectivity requires endpoint and route discovery mechanisms not defined in public contracts
 
 **Date:** 2026-10-05 (PR #8 fix)
