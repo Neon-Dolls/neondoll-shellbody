@@ -75,6 +75,10 @@ func UnmarshalBinary(data []byte) (*PacketFrame, error) {
 	if len(data) < twgEnd {
 		return nil, errors.New("packet frame data too short for declared length")
 	}
+	// Check for trailing bytes
+	if len(data) > twgEnd {
+		return nil, errors.New("packet frame has trailing bytes")
+	}
 	pf.WireGuard = make([]byte, pf.PacketLen)
 	copy(pf.WireGuard, data[twgStart:twgEnd])
 
