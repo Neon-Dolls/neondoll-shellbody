@@ -58,89 +58,71 @@ func NewMobilityManager(membership *Membership, bodyID string,
 // after a delay. It preserves the membership and bodyID across
 // reconnect cycles.
 func (m *MobilityManager) Run(ctx context.Context) error {
-	var (
-		currentTransport Transport
-		currentClient    clientRunner
-		clientDone       chan struct{}
-		clientErr        chan error
-		backoff          = m.reconnectDelay
-	)
-
+	var backoff time.Duration = m.reconnectDelay
 	for {
-		// Check for cancellation before starting a new attempt.
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
 
-		// If we have a current client, wait for it to exit.
-		if currentClient != nil {
+		// Obtain a transport, retrying with backoff on failure.
+		transport, err := m.transportFactory()
+		if err != nil {
+			// Factory failed (e.g., no endpoint info). Wait and retry.
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case err := <-clientErr:
-				// Client exited. Close the transport and reset.
-				if currentTransport != nil {
-					_ = currentTransport.Close()
-					currentTransport = nil
-				}
-				currentClient = nil
-				clientDone = nil
-				clientErr = nil
-
-				// If the error is due to context cancellation, we should exit.
-				if errors.Is(err, context.Canceled) {
-					return err
-				}
-				// Otherwise, treat as transport failure and retry.
-				// We will continue to the reconnect logic below.
-			case <-clientDone:
-				// Client exited without error (unlikely, but handle).
-				if currentTransport != nil {
-					_ = currentTransport.Close()
-					currentTransport = nil
-				}
-				currentClient = nil
-				clientDone = nil
-				clientErr = nil
-				// Continue to reconnect.
+			case <-time.After(backoff):
 			}
-		}
-
-		// If we don't have a current client, try to create a new transport.
-		if currentTransport == nil {
-			transport, err := m.transportFactory()
-			if err != nil {
-				// Factory failed (e.g., no endpoint info). Wait and retry.
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(backoff):
+			// Exponential backoff with jitter avoided for determinism.
+			if backoff < m.maxReconnectDelay {
+				backoff *= 2
+				if backoff > m.maxReconnectDelay {
+					backoff = m.maxReconnectDelay
 				}
-				// Exponential backoff with jitter to avoid thundering herd.
-				if backoff < m.maxReconnectDelay {
-					backoff = backoff * 2
-					if backoff > m.maxReconnectDelay {
-						backoff = m.maxReconnectDelay
-					}
-				}
-				continue
 			}
-			currentTransport = transport
-			// Reset backoff on successful transport creation.
-			backoff = m.reconnectDelay
+			continue
 		}
+		// Transport created successfully; reset backoff.
+		backoff = m.reconnectDelay
 
-		// Now we have a transport, create the client.
-		if currentClient == nil {
-			currentClient = m.clientFactory(currentTransport)
-			clientDone = make(chan struct{})
-			clientErr = make(chan error, 1)
-			go func() {
-				defer close(clientDone)
-				clientErr <- currentClient.Run(ctx)
-			}()
+		// Create client for this transport.
+		client := m.clientFactory(transport)
+
+		// Channel to receive the result of client.Run.
+		clientErrChan := make(chan error, 1)
+		go func() {
+			clientErrChan <- client.Run(ctx)
+		}()
+
+		// Wait for client result or cancellation.
+		select {
+		case <-ctx.Done():
+			// Cancellation: close transport and exit.
+			_ = transport.Close()
+			return ctx.Err()
+		case err := <-clientErrChan:
+			// Client exited. Close its transport.
+			_ = transport.Close()
+			if errors.Is(err, context.Canceled) {
+				// Should not happen because we already checked ctx.Done, but handle.
+				return err
+			}
+			// Client failed with non-cancellation error: treat as transport
+			// failure and retry after backoff.
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			if backoff < m.maxReconnectDelay {
+				backoff *= 2
+				if backoff > m.maxReconnectDelay {
+					backoff = m.maxReconnectDelay
+				}
+			}
+			// Loop to obtain a new transport.
 		}
 	}
 }
