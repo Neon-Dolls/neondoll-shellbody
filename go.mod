@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/Neon-Dolls/neondoll v0.0.0-20260929143111-717147e73612
 	github.com/google/uuid v1.6.0
+	golang.org/x/net v0.21.0
 )
 
 require (

@@ -136,4 +136,30 @@ This is distinct from the M4 Interaction Session hole (which concerns terminal I
 
 M5 wire integration is blocked until the process capability's operations and operation-specific request/result schema are canonicalized in the public specification.
 
+## M6 — Relay connectivity requires endpoint and route discovery mechanisms not defined in public contracts
 
+**Date:** 2026-10-05 (PR #8 fix)
+**Files consulted (public specs only):** `doll-relay-protocol.md` (v1), `doll-network-protocol.md` (v1)
+**Question investigated:** whether the public contracts provide enough information for:
+  A. Relay UDP endpoint discovery
+  B. route ID discovery/persistence
+  C. Relay WSS endpoint discovery
+  D. direct/UDP/WSS path selection
+**Result: protocol hole.** The public contracts do not specify the mechanisms for endpoint discovery, route ID discovery/persistence, or path selection. The Shell Body cannot determine the Relay endpoint, obtain the route_id, or choose between direct and relayed paths without additional, unspecified mechanisms.
+
+A. Relay UDP endpoint discovery
+   - The public contract does not specify how the Body learns the Relay's public UDP endpoint and the associated route_id.
+   - The doll-relay-protocol.md defines the structure of the endpoint and the route_id in the Binary Packet Frame, but does not specify a mechanism for the Body to discover them.
+
+B. route ID discovery/persistence
+   - The public contract does not specify how the Body obtains the route_id or that it must be persisted across restarts.
+   - The doll-relay-protocol.md mentions the route_id in the Binary Packet Frame and in the endpoint configuration, but does not specify how the Body learns it initially.
+
+C. Relay WSS endpoint discovery
+   - The public contract does not specify how the Body learns the Relay's WSS endpoint (host, port, path) and the associated route_id.
+   - The doll-relay-protocol.md mentions that the Relay exposes a WebSocket endpoint over TLS on TCP/443, but does not specify how the Body discovers the host, port, and path.
+   - The doll-network-protocol.md does not contain any WSS-specific endpoint fields.
+
+D. direct/UDP/WSS path selection
+   - The public contract does not specify how the Body learns about the available direct path or the advertised relay path.
+   - The doll-network-protocol.md states in section 5. Path Selection that the Body SHOULD prefer a working direct path and MAY attempt an advertised Relay path, but does not specify how the Body learns about the direct path or how the relay path is advertised.
