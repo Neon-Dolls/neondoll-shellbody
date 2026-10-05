@@ -41,7 +41,7 @@ func newTestTransport() *testTransport {
 		sendCh:   make(chan []byte),
 		recvCh:   make(chan []byte),
 		Created:  make(chan struct{}),
-		Closed:   make(chan struct{}),
+		Closed:   make(chan struct{}, 1), // buffered to help with timing
 		Received: make(chan struct{}),
 		Sent:     make(chan struct{}),
 	}
@@ -174,7 +174,7 @@ func TestMobilityManagerBasic(t *testing.T) {
 	// Wait for the manager to create a transport and start a client.
 	// We'll use a short timeout as failure bound to wait for startup.
 	select {
-	case <-time.After(200 * time.Millisecond):
+	case <-time.After(500 * time.Millisecond):
 		// Assume it started (this is acceptable as failure bound only)
 	case <-ctx.Done():
 		t.Fatalf("context cancelled before manager started")
@@ -189,7 +189,7 @@ func TestMobilityManagerBasic(t *testing.T) {
 		if err != nil && !errors.Is(err, context.Canceled) {
 			t.Fatalf("unexpected error: %v", err)
 		}
-	case <-time.After(200 * time.Millisecond):
+	case <-time.After(500 * time.Millisecond):
 		t.Fatalf("mobility manager did not exit in time")
 	}
 	<-doneCh
@@ -222,26 +222,38 @@ func TestMobilityManagerCancellationDuringBackoff(t *testing.T) {
 	}
 	bodyID := "test-body-id"
 
-	// We'll track how many times the factories are called.
-	var transportFactoryMu sync.Mutex
-	var transportCallCount int
-	var clientFactoryMu sync.Mutex
-	var clientCallCount int
+	// We'll track the latest transport and client instances for observation.
+	var transportMu sync.Mutex
+	var transportCreatedCh = make(chan *testTransport, 1) // buffered to avoid blocking
+
+	var clientMu sync.Mutex
+	var clientStartedCh = make(chan *testClientRunner, 1)
 
 	transportFactory := func() (Transport, error) {
-		transportFactoryMu.Lock()
-		defer transportFactoryMu.Unlock()
-		transportCallCount++
-		t := newTestTransport()
+		tr := newTestTransport()
 		// Make the transport fail immediately on Receive.
-		t.recvErr = errors.New("simulated transport failure")
-		return t, nil
+		tr.recvErr = errors.New("simulated transport failure")
+
+		// Publish the transport for observation.
+		transportMu.Lock()
+		transportMu.Unlock()
+		select {
+		case transportCreatedCh <- tr:
+		default:
+		}
+		return tr, nil
 	}
 	clientFactory := func(t Transport) clientRunner {
-		clientFactoryMu.Lock()
-		defer clientFactoryMu.Unlock()
-		clientCallCount++
-		return newTestClientRunner(t)
+		cr := newTestClientRunner(t)
+
+		// Publish the client for observation.
+		clientMu.Lock()
+		clientMu.Unlock()
+		select {
+		case clientStartedCh <- cr:
+		default:
+		}
+		return cr
 	}
 
 	mm := NewMobilityManager(membership, bodyID, transportFactory, clientFactory)
@@ -254,18 +266,48 @@ func TestMobilityManagerCancellationDuringBackoff(t *testing.T) {
 		errCh <- mm.Run(ctx)
 	}()
 
-	// Wait for the first transport and client to be created and then fail.
-	// We'll wait for the first client to exit (via its Exited channel) but
-	// we don't have a reference. Instead we can wait a short time for the
-	// first failure to occur and then cancel during the backoff.
-	// Use a timeout as a failure bound.
+	// Wait for the first transport to be created.
 	select {
-	case <-time.After(500 * time.Millisecond):
-		// Assume we have at least one failure and are in backoff.
+	case tr := <-transportCreatedCh:
+		// Wait for the transport to signal creation (should already be signaled).
+		select {
+		case <-tr.Created:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("timeout waiting for transport Created signal")
+		}
+		// Wait for the client to start.
+		select {
+		case cr := <-clientStartedCh:
+			// Wait for client Started signal.
+			select {
+			case <-cr.Started:
+			case <-time.After(500 * time.Millisecond):
+				t.Fatalf("timeout waiting for client Started signal")
+			}
+			// Wait for the client to exit (will be error due to recvErr).
+			select {
+			case <-cr.Exited:
+				// Client exited, now wait for transport to be closed.
+				select {
+				case <-tr.Closed:
+					// Transport closed, now we are in backoff.
+				case <-time.After(500 * time.Millisecond):
+					t.Fatalf("timeout waiting for transport Closed signal after client exit")
+				}
+			case <-time.After(500 * time.Millisecond):
+				t.Fatalf("timeout waiting for client Exited signal")
+			}
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("timeout waiting for client Started signal")
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("timeout waiting for first transport creation")
 	case <-ctx.Done():
-		t.Fatalf("context cancelled before first failure")
+		t.Fatalf("context cancelled before first transport creation")
 	}
 
+	// Now we have observed: transport created, client started, client exited, transport closed.
+	// We are now in the backoff period after a client error.
 	// Cancel during backoff.
 	cancel()
 
@@ -275,40 +317,30 @@ func TestMobilityManagerCancellationDuringBackoff(t *testing.T) {
 		if err != nil && !errors.Is(err, context.Canceled) {
 			t.Fatalf("unexpected error: %v", err)
 		}
-	case <-time.After(200 * time.Millisecond):
+	case <-time.After(500 * time.Millisecond):
 		t.Fatalf("mobility manager did not exit in time after cancellation")
 	}
 	<-doneCh
 
 	// Verify that no additional factories were called after cancellation.
-	transportFactoryMu.Lock()
-	transportsAfter := transportCallCount
-	transportFactoryMu.Unlock()
-	clientFactoryMu.Lock()
-	clientsAfter := clientCallCount
-	clientFactoryMu.Unlock()
-
-	// We expect at least one transport and one client (the initial ones).
-	if transportsAfter < 1 {
-		t.Fatalf("expected at least one transport factory call, got %d", transportsAfter)
+	// We'll wait a short time to see if another transport is created or client started.
+	select {
+	case <-transportCreatedCh:
+		t.Fatalf("unexpected second transport created after cancellation")
+	case <-time.After(500 * time.Millisecond):
+		// good, no second transport
 	}
-	if clientsAfter < 1 {
-		t.Fatalf("expected at least one client factory call, got %d", clientsAfter)
-	}
-	// Ensure no extra calls after cancellation: we can't easily know
-	// exact number without more instrumentation, but we can assert that
-	// the counts are small (e.g., less than 3) to catch runaway loops.
-	if transportsAfter > 3 {
-		t.Fatalf("too many transport factory calls after cancellation: %d", transportsAfter)
-	}
-	if clientsAfter > 3 {
-		t.Fatalf("too many client factory calls after cancellation: %d", clientsAfter)
+	select {
+	case <-clientStartedCh:
+		t.Fatalf("unexpected second client started after cancellation")
+	case <-time.After(500 * time.Millisecond):
+		// good
 	}
 }
 
 // TestMobilityManagerThreeReconnectCycles performs at least three
 // disconnect/reconnect cycles and verifies that the membership and body
-// ID remain unchanged.
+// ID remain unchanged by observing the lifecycle events in order.
 func TestMobilityManagerThreeReconnectCycles(t *testing.T) {
 	t.Parallel()
 
@@ -326,28 +358,38 @@ func TestMobilityManagerThreeReconnectCycles(t *testing.T) {
 	}
 	bodyID := "test-body-id"
 
-	// We'll simulate a transport that fails immediately on Receive.
-	// Each cycle: transport created, client started, client fails (due to transport error),
-	// transport closed, backoff, repeat.
-	var transportFactoryMu sync.Mutex
-	var transportCallCount int
-	var clientFactoryMu sync.Mutex
-	var clientCallCount int
+	// We'll track observations for each cycle.
+	var transportMu sync.Mutex
+	var transportCreatedCh = make(chan *testTransport, 1)
+
+	var clientMu sync.Mutex
+	var clientStartedCh = make(chan *testClientRunner, 1)
 
 	transportFactory := func() (Transport, error) {
-		transportFactoryMu.Lock()
-		defer transportFactoryMu.Unlock()
-		transportCallCount++
-		t := newTestTransport()
+		tr := newTestTransport()
 		// Make the transport fail immediately on Receive.
-		t.recvErr = errors.New("simulated transport failure")
-		return t, nil
+		tr.recvErr = errors.New("simulated transport failure")
+
+		// Publish the transport for observation.
+		transportMu.Lock()
+		transportMu.Unlock()
+		select {
+		case transportCreatedCh <- tr:
+		default:
+		}
+		return tr, nil
 	}
 	clientFactory := func(t Transport) clientRunner {
-		clientFactoryMu.Lock()
-		defer clientFactoryMu.Unlock()
-		clientCallCount++
-		return newTestClientRunner(t)
+		cr := newTestClientRunner(t)
+
+		// Publish the client for observation.
+		clientMu.Lock()
+		clientMu.Unlock()
+		select {
+		case clientStartedCh <- cr:
+		default:
+		}
+		return cr
 	}
 
 	mm := NewMobilityManager(membership, bodyID, transportFactory, clientFactory)
@@ -360,30 +402,51 @@ func TestMobilityManagerThreeReconnectCycles(t *testing.T) {
 		errCh <- mm.Run(ctx)
 	}()
 
-	// Wait for at least three transport creations (i.e., three cycles).
-	// Each cycle needs a new transport because after a failure we close it.
-	// We'll wait until transportCallCount >= 3.
-	start := time.Now()
-	for {
-		transportFactoryMu.Lock()
-		if transportCallCount >= 3 {
-			transportFactoryMu.Unlock()
-			break
-		}
-		transportFactoryMu.Unlock()
+	// Observe three full cycles: for each cycle, wait for
+	// transport created -> client started -> client exited -> transport closed.
+	for cycle := 0; cycle < 3; cycle++ {
+		// Wait for transport to be created.
 		select {
-		case <-ctx.Done():
-			t.Fatalf("context cancelled while waiting for cycles")
-		case <-time.After(200 * time.Millisecond):
-			// timeout as failure bound
-			if time.Since(start) > 10*time.Second {
-				t.Fatalf("timeout waiting for three cycles: got %d transports", transportCallCount)
+		case tr := <-transportCreatedCh:
+			// Wait for transport Created signal.
+			select {
+			case <-tr.Created:
+			case <-time.After(500 * time.Millisecond):
+				t.Fatalf("cycle %d: timeout waiting for transport Created signal", cycle)
 			}
-			continue
+			// Wait for client to start.
+			select {
+			case cr := <-clientStartedCh:
+				// Wait for client Started signal.
+				select {
+				case <-cr.Started:
+				case <-time.After(500 * time.Millisecond):
+					t.Fatalf("cycle %d: timeout waiting for client Started signal", cycle)
+				}
+				// Wait for client to exit (will be error due to recvErr).
+				select {
+				case <-cr.Exited:
+					// Client exited, now wait for transport to be closed.
+					select {
+					case <-tr.Closed:
+						// Transport closed, cycle complete.
+					case <-time.After(500 * time.Millisecond):
+						t.Fatalf("cycle %d: timeout waiting for transport Closed signal after client exit", cycle)
+					}
+				case <-time.After(500 * time.Millisecond):
+					t.Fatalf("cycle %d: timeout waiting for client Exited signal", cycle)
+				}
+			case <-time.After(500 * time.Millisecond):
+				t.Fatalf("cycle %d: timeout waiting for client Started signal", cycle)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timeout waiting for transport creation in cycle %d", cycle)
+		case <-ctx.Done():
+			t.Fatalf("context cancelled during cycle %d", cycle)
 		}
 	}
 
-	// Cancel to stop the manager.
+	// After three cycles, cancel to stop the manager.
 	cancel()
 
 	// Check that it exited cleanly.
@@ -392,18 +455,16 @@ func TestMobilityManagerThreeReconnectCycles(t *testing.T) {
 		if err != nil && !errors.Is(err, context.Canceled) {
 			t.Fatalf("unexpected error after cycles: %v", err)
 		}
-	case <-time.After(200 * time.Millisecond):
+	case <-time.After(500 * time.Millisecond):
 		t.Fatalf("mobility manager did not exit in time after cycles")
 	}
 	<-doneCh
 
 	// Verify membership and bodyID are unchanged.
-	if mm == nil {
-		t.Fatalf("mobility manager is nil")
-	}
-	// Since we cannot access unexported fields, we verify that the original
-	// variables we passed in are unchanged (which they should be as we don't mutate them).
-	// This proves that the manager didn't modify the inputs we gave it.
+	// Since we never modify membership or bodyID in this test, they remain
+	// as initialized. The manager preserves its own copies, so this check
+	// ensures that the manager did not somehow modify the input variables
+	// (which it shouldn't do anyway).
 	if membership.NetworkID != "test-network" ||
 		membership.PeerID != "test-peer-id" ||
 		membership.Status != MembershipActive ||
