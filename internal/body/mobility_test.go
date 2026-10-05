@@ -17,14 +17,14 @@ func TestMobilityManagerBasic(t *testing.T) {
 
 	// Create a fake membership and body ID
 	membership := &Membership{
-		NetworkID:   "test-network",
-		PeerID:      "test-peer-id",
-		Status:      MembershipActive,
-		BodyPeerID:  "test-body-peer-id",
-		BodyIPv6:    "2001:db8::1",
+		NetworkID:     "test-network",
+		PeerID:        "test-peer-id",
+		Status:        MembershipActive,
+		BodyPeerID:    "test-body-peer-id",
+		BodyIPv6:      "2001:db8::1",
 		BodyAddresses: []string{"2001:db8::1"},
-		CorePeerID:  "test-core-peer-id",
-		CoreWGKeyB64: "BASE64KEY==",
+		CorePeerID:    "test-core-peer-id",
+		CoreWGKeyB64:  "BASE64KEY==",
 		CoreAddresses: []string{"fd00::1"},
 		CoreEndpoints: []string{"https://core.example.com"},
 	}
@@ -86,14 +86,14 @@ func TestMobilityManagerTransportFailure(t *testing.T) {
 
 	// Create a fake membership and body ID
 	membership := &Membership{
-		NetworkID:   "test-network",
-		PeerID:      "test-peer-id",
-		Status:      MembershipActive,
-		BodyPeerID:  "test-body-peer-id",
-		BodyIPv6:    "2001:db8::1",
+		NetworkID:     "test-network",
+		PeerID:        "test-peer-id",
+		Status:        MembershipActive,
+		BodyPeerID:    "test-body-peer-id",
+		BodyIPv6:      "2001:db8::1",
 		BodyAddresses: []string{"2001:db8::1"},
-		CorePeerID:  "test-core-peer-id",
-		CoreWGKeyB64: "BASE64KEY==",
+		CorePeerID:    "test-core-peer-id",
+		CoreWGKeyB64:  "BASE64KEY==",
 		CoreAddresses: []string{"fd00::1"},
 		CoreEndpoints: []string{"https://core.example.com"},
 	}

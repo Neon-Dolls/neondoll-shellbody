@@ -17,11 +17,11 @@ type clientRunner interface {
 // state while tearing down and recreating only ephemeral transport
 // and client state.
 type MobilityManager struct {
-	mu            sync.RWMutex
-	membership    *Membership
-	bodyID        string
+	mu               sync.RWMutex
+	membership       *Membership
+	bodyID           string
 	transportFactory func() (Transport, error)
-	clientFactory   func(Transport) clientRunner
+	clientFactory    func(Transport) clientRunner
 	// reconnectDelay is the base delay between reconnect attempts.
 	reconnectDelay time.Duration
 	// maxReconnectDelay is the maximum delay between reconnect attempts.
@@ -43,11 +43,11 @@ func NewMobilityManager(membership *Membership, bodyID string,
 		panic("client factory must not be nil")
 	}
 	return &MobilityManager{
-		membership:    membership,
-		bodyID:        bodyID,
-		transportFactory: tf,
-		clientFactory:  cf,
-		reconnectDelay: time.Second,
+		membership:        membership,
+		bodyID:            bodyID,
+		transportFactory:  tf,
+		clientFactory:     cf,
+		reconnectDelay:    time.Second,
 		maxReconnectDelay: time.Minute,
 	}
 }
