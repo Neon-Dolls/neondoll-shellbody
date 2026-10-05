@@ -172,16 +172,12 @@ func TestMobilityManagerBasic(t *testing.T) {
 	}()
 
 	// Wait for the manager to create a transport and start a client.
-	// We'll rely on the fact that the first transport factory call will
-	// signal via transport.Created, but we don't have a reference to it.
-	// Instead we can wait a short time for the manager to start; but to
-	// avoid sleeps we can expose a channel from the manager? Not needed.
-	// We'll use a select with a short timeout as a failure bound.
+	// We'll use a short timeout as failure bound to wait for startup.
 	select {
 	case <-time.After(200 * time.Millisecond):
-		// Assume it started.
+		// Assume it started (this is acceptable as failure bound only)
 	case <-ctx.Done():
-		t.Fatal("context cancelled before manager started")
+		t.Fatalf("context cancelled before manager started")
 	}
 
 	// Cancel while client is running.
@@ -267,7 +263,7 @@ func TestMobilityManagerCancellationDuringBackoff(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 		// Assume we have at least one failure and are in backoff.
 	case <-ctx.Done():
-		t.Fatal("context cancelled before first failure")
+		t.Fatalf("context cancelled before first failure")
 	}
 
 	// Cancel during backoff.
@@ -330,10 +326,6 @@ func TestMobilityManagerThreeReconnectCycles(t *testing.T) {
 	}
 	bodyID := "test-body-id"
 
-	// Snapshot the membership and bodyID for later comparison.
-	snapMembership := *membership // shallow copy; but we will not mutate the original.
-	snapBodyID := bodyID
-
 	// We'll simulate a transport that fails immediately on Receive.
 	// Each cycle: transport created, client started, client fails (due to transport error),
 	// transport closed, backoff, repeat.
@@ -381,7 +373,7 @@ func TestMobilityManagerThreeReconnectCycles(t *testing.T) {
 		transportFactoryMu.Unlock()
 		select {
 		case <-ctx.Done():
-			t.Fatal("context cancelled while waiting for cycles")
+			t.Fatalf("context cancelled while waiting for cycles")
 		case <-time.After(200 * time.Millisecond):
 			// timeout as failure bound
 			if time.Since(start) > 10*time.Second {
@@ -409,27 +401,21 @@ func TestMobilityManagerThreeReconnectCycles(t *testing.T) {
 	if mm == nil {
 		t.Fatalf("mobility manager is nil")
 	}
-	// We cannot access unexported fields, but we can at least check that
-	// the manager is non-nil and the test didn't panic.
-	// For a stricter check, we would need to export getters or use reflection,
-	// but given the constraints we rely on the fact that the manager never
-	// modifies those fields.
-	// We'll also verify that the snapshot we took equals the original
-	// (which it should because we never mutated them).
-	if membership.NetworkID != snapMembership.NetworkID ||
-		membership.PeerID != snapMembership.PeerID ||
-		membership.Status != snapMembership.Status ||
-		membership.BodyPeerID != snapMembership.BodyPeerID ||
-		membership.BodyIPv6 != snapMembership.BodyIPv6 ||
-		!equalSlice(membership.BodyAddresses, snapMembership.BodyAddresses) ||
-		membership.CorePeerID != snapMembership.CorePeerID ||
-		membership.CoreWGKeyB64 != snapMembership.CoreWGKeyB64 ||
-		!equalSlice(membership.CoreAddresses, snapMembership.CoreAddresses) ||
-		!equalSlice(membership.CoreEndpoints, snapMembership.CoreEndpoints) {
-		t.Fatalf("membership changed after cycles")
-	}
-	if bodyID != snapBodyID {
-		t.Fatalf("bodyID changed after cycles: want %s, got %s", snapBodyID, bodyID)
+	// Since we cannot access unexported fields, we verify that the original
+	// variables we passed in are unchanged (which they should be as we don't mutate them).
+	// This proves that the manager didn't modify the inputs we gave it.
+	if membership.NetworkID != "test-network" ||
+		membership.PeerID != "test-peer-id" ||
+		membership.Status != MembershipActive ||
+		membership.BodyPeerID != "test-body-peer-id" ||
+		membership.BodyIPv6 != "2001:db8::1" ||
+		!equalSlice(membership.BodyAddresses, []string{"2001:db8::1"}) ||
+		membership.CorePeerID != "test-core-peer-id" ||
+		membership.CoreWGKeyB64 != "BASE64KEY==" ||
+		!equalSlice(membership.CoreAddresses, []string{"fd00::1"}) ||
+		!equalSlice(membership.CoreEndpoints, []string{"https://core.example.com"}) ||
+		bodyID != "test-body-id" {
+		t.Fatalf("membership or bodyID changed after cycles")
 	}
 }
 
