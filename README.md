@@ -277,3 +277,26 @@ internal/tunnel          Reusable WireGuard tunnel manager + private path
 ## License
 
 See [LICENSE](LICENSE).
+## Supported Protocol Versions
+
+The Shell Body implements the following public protocol versions to the extent tested and verified against public specifications:
+
+- **Doll Network Protocol: v1**
+  - Identity stability (M1): implemented + tested
+  - Pairing (M2): implemented + tested
+  - Direct Doll Network (M3): implemented but not externally conformance-tested (blocked in practice by missing direct WG endpoint advertisement)
+  - Doll Link framing/hello/capabilities/ready groundwork (M4): implemented + tested
+  - Terminal interaction/session behavior (M4): blocked by public protocol contract
+  - Local host process executor (M5): implemented + tested
+  - Canonical wire mapping for process execution (M5): blocked by public protocol contract
+  - Relay UDP/WSS transport primitives (M6): implemented + tested
+  - Relay discovery/route/path selection (M6): blocked by public protocol contract
+  - Mobility/reconnect (M7): implemented but not externally conformance-tested
+  - Durable restart/migration groundwork (M8): implemented + tested (internal integration coverage)
+  - Conformance baseline/inventory (M9): established by this document
+
+- **Doll Link Protocol: v1**
+  - Not implemented for wire negotiation (requires M6: Relay connectivity and M7: Mobility/reconnect for actual network negotiation)
+  - Groundwork implemented: Doll Link framing, hello, capability exchange, ready state machinery present and tested (M4)
+
+These versions are defined in the public specifications. Conformance claims are limited to what is implemented and tested without relying on private Core internals or invented contracts. See M9_CONFORMANCE_INVENTORY.md for details.
