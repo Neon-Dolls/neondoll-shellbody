@@ -110,18 +110,14 @@ func TestMobilityManagerMigration(t *testing.T) {
 	}
 
 	// Set up test harness to observe MobilityManager behavior
-	var transportMu sync.Mutex
-	var transportCreatedCh = make(chan *testTransportMig, 1)
-	var clientMu sync.Mutex
-	var clientStartedCh = make(chan *testClientRunnerMig, 1)
+	var transportCreatedCh = make(chan *testTransport, 1)
+	var clientStartedCh = make(chan *testClientRunner, 1)
 
 	transportFactory := func() (Transport, error) {
-		tr := newTestTransportMig()
+		tr := newTestTransport()
 		// Make transport fail immediately to trigger reconnect logic
 		tr.recvErr = errors.New("simulated transport failure")
 
-		transportMu.Lock()
-		transportMu.Unlock()
 		select {
 		case transportCreatedCh <- tr:
 		default:
@@ -130,10 +126,8 @@ func TestMobilityManagerMigration(t *testing.T) {
 	}
 
 	clientFactory := func(t Transport) clientRunner {
-		cr := newTestClientRunnerMig(t)
+		cr := newTestClientRunner(t)
 
-		clientMu.Lock()
-		clientMu.Unlock()
 		select {
 		case clientStartedCh <- cr:
 		default:
@@ -263,8 +257,11 @@ func TestMobilityManagerMigration(t *testing.T) {
 	}
 }
 
-// Helper types for mobility test observation (names suffixed to avoid duplication with mobility_test.go)
-type testTransportMig struct {
+// Helper types for mobility test observation (copied from mobility_test.go in m7-mobility-reconnect)
+
+// testTransport is a fake transport for testing that provides synchronization
+// channels to observe its lifecycle.
+type testTransport struct {
 	mu       sync.Mutex
 	sendCh   chan []byte
 	recvCh   chan []byte
@@ -274,26 +271,34 @@ type testTransportMig struct {
 	closed   bool
 
 	// Channels for test observation.
-	Created  chan struct{}
-	Closed   chan struct{}
+	// closed when the transport is created (i.e., factory returns).
+	Created chan struct{}
+	// closed when Close is called.
+	Closed chan struct{}
+	// closed when Receive is called (successful or error).
 	Received chan struct{}
-	Sent     chan struct{}
+	// closed when Send is called.
+	Sent chan struct{}
 }
 
-func newTestTransportMig() *testTransportMig {
-	t := &testTransportMig{
+// newTestTransport returns a newly initialized testTransport with
+// the observation channels set up.
+func newTestTransport() *testTransport {
+	t := &testTransport{
 		sendCh:   make(chan []byte),
 		recvCh:   make(chan []byte),
 		Created:  make(chan struct{}),
-		Closed:   make(chan struct{}, 1),
+		Closed:   make(chan struct{}, 1), // buffered to help with timing
 		Received: make(chan struct{}),
 		Sent:     make(chan struct{}),
 	}
+	// Signal creation immediately.
 	close(t.Created)
 	return t
 }
 
-func (t *testTransportMig) Send(ctx context.Context, msg link.Envelope) error {
+// Send implements Transport.
+func (t *testTransport) Send(ctx context.Context, msg link.Envelope) error {
 	t.mu.Lock()
 	if t.sendErr != nil {
 		t.mu.Unlock()
@@ -316,7 +321,8 @@ func (t *testTransportMig) Send(ctx context.Context, msg link.Envelope) error {
 	}
 }
 
-func (t *testTransportMig) Receive(ctx context.Context) (*link.Envelope, error) {
+// Receive implements Transport.
+func (t *testTransport) Receive(ctx context.Context) (*link.Envelope, error) {
 	t.mu.Lock()
 	if t.recvErr != nil {
 		t.mu.Unlock()
@@ -335,7 +341,8 @@ func (t *testTransportMig) Receive(ctx context.Context) (*link.Envelope, error) 
 	return &msg, nil
 }
 
-func (t *testTransportMig) Close() error {
+// Close implements Transport.
+func (t *testTransport) Close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.closed = true
@@ -346,22 +353,27 @@ func (t *testTransportMig) Close() error {
 	return t.closeErr
 }
 
-type testClientRunnerMig struct {
+// testClientRunner is a fake client runner for testing that provides
+// synchronization channels to observe its lifecycle.
+type testClientRunner struct {
 	Transport Transport
-	Started   chan struct{}
-	Exited    chan error
+	Started   chan struct{} // closed when Run is called
+	Exited    chan error    // receives the error from Run (or nil)
+	// Optionally, we can set an error to be returned by Run via Transport.
 }
 
-func newTestClientRunnerMig(t Transport) *testClientRunnerMig {
-	return &testClientRunnerMig{
+func newTestClientRunner(t Transport) *testClientRunner {
+	return &testClientRunner{
 		Transport: t,
 		Started:   make(chan struct{}),
 		Exited:    make(chan error, 1),
 	}
 }
 
-func (cr *testClientRunnerMig) Run(ctx context.Context) error {
+// Run implements clientRunner.
+func (cr *testClientRunner) Run(ctx context.Context) error {
 	close(cr.Started)
+	// Delegate to the transport's Receive (which will block or error).
 	_, err := cr.Transport.Receive(ctx)
 	cr.Exited <- err
 	return err
