@@ -277,3 +277,11 @@ internal/tunnel          Reusable WireGuard tunnel manager + private path
 ## License
 
 See [LICENSE](LICENSE).
+## Supported Protocol Versions
+
+The Shell Body supports the following public protocol versions:
+
+- Doll Network Protocol: v1
+- Doll Link Protocol: v1
+
+These versions are defined in the public specifications and are implemented without relying on private Core internals.
