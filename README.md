@@ -279,9 +279,19 @@ internal/tunnel          Reusable WireGuard tunnel manager + private path
 See [LICENSE](LICENSE).
 ## Supported Protocol Versions
 
-The Shell Body supports the following public protocol versions:
+The Shell Body implements the following public protocol versions to the extent tested and verified against public specifications:
 
-- Doll Network Protocol: v1
-- Doll Link Protocol: v1
+- **Doll Network Protocol: v1**
+  - Identity stability (M1): implemented + tested
+  - Pairing (M2): implemented + tested
+  - Direct Doll Network (M3): implemented but not externally conformance-tested (blocked in practice by missing direct WG endpoint advertisement)
+  - Interaction/session behavior (M4): blocked by public protocol contract
+  - Explicit capability execution (M5): blocked by public protocol contract
+  - Relay connectivity (M6): blocked by public protocol contract
+  - Doll Link negotiation (M7): not implemented
+  - Reconnect/mobility/restart/Core migration (M9): partially implemented (restart/Core migration tested; reconnect/mobility not externally tested)
 
-These versions are defined in the public specifications and are implemented without relying on private Core internals.
+- **Doll Link Protocol: v1**
+  - Not implemented (requires M7: Doll Link negotiation)
+
+These versions are defined in the public specifications. Conformance claims are limited to what is implemented and tested without relying on private Core internals or invented contracts. See M9_CONFORMANCE_INVENTORY.md for details.
