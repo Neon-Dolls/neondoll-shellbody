@@ -2,15 +2,11 @@ package body
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/Neon-Dolls/neondoll-shellbody/internal/identity"
-	"github.com/Neon-Dolls/neondoll-shellbody/internal/link"
 )
 
 // TestMobilityManagerMigration tests that the durable relationship (identity,
@@ -255,126 +251,4 @@ func TestMobilityManagerMigration(t *testing.T) {
 		finalMem.CoreWGKeyB64 != membership.CoreWGKeyB64 {
 		t.Fatalf("Membership changed after tests: expected %+v, got %+v", membership, finalMem)
 	}
-}
-
-// Helper types for mobility test observation (copied from mobility_test.go in m7-mobility-reconnect)
-
-// testTransport is a fake transport for testing that provides synchronization
-// channels to observe its lifecycle.
-type testTransport struct {
-	mu       sync.Mutex
-	sendCh   chan []byte
-	recvCh   chan []byte
-	sendErr  error
-	recvErr  error
-	closeErr error
-	closed   bool
-
-	// Channels for test observation.
-	// closed when the transport is created (i.e., factory returns).
-	Created chan struct{}
-	// closed when Close is called.
-	Closed chan struct{}
-	// closed when Receive is called (successful or error).
-	Received chan struct{}
-	// closed when Send is called.
-	Sent chan struct{}
-}
-
-// newTestTransport returns a newly initialized testTransport with
-// the observation channels set up.
-func newTestTransport() *testTransport {
-	t := &testTransport{
-		sendCh:   make(chan []byte),
-		recvCh:   make(chan []byte),
-		Created:  make(chan struct{}),
-		Closed:   make(chan struct{}, 1), // buffered to help with timing
-		Received: make(chan struct{}),
-		Sent:     make(chan struct{}),
-	}
-	// Signal creation immediately.
-	close(t.Created)
-	return t
-}
-
-// Send implements Transport.
-func (t *testTransport) Send(ctx context.Context, msg link.Envelope) error {
-	t.mu.Lock()
-	if t.sendErr != nil {
-		t.mu.Unlock()
-		return t.sendErr
-	}
-	t.mu.Unlock()
-	select {
-	case t.Sent <- struct{}{}:
-	default:
-	}
-	data, err := json.Marshal(msg)
-	if err != nil {
-		return fmt.Errorf("failed to marshal envelope: %w", err)
-	}
-	select {
-	case t.sendCh <- data:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-// Receive implements Transport.
-func (t *testTransport) Receive(ctx context.Context) (*link.Envelope, error) {
-	t.mu.Lock()
-	if t.recvErr != nil {
-		t.mu.Unlock()
-		return nil, t.recvErr
-	}
-	t.mu.Unlock()
-	select {
-	case t.Received <- struct{}{}:
-	default:
-	}
-	data := <-t.recvCh
-	var msg link.Envelope
-	if err := json.Unmarshal(data, &msg); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal envelope: %w", err)
-	}
-	return &msg, nil
-}
-
-// Close implements Transport.
-func (t *testTransport) Close() error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.closed = true
-	select {
-	case t.Closed <- struct{}{}:
-	default:
-	}
-	return t.closeErr
-}
-
-// testClientRunner is a fake client runner for testing that provides
-// synchronization channels to observe its lifecycle.
-type testClientRunner struct {
-	Transport Transport
-	Started   chan struct{} // closed when Run is called
-	Exited    chan error    // receives the error from Run (or nil)
-	// Optionally, we can set an error to be returned by Run via Transport.
-}
-
-func newTestClientRunner(t Transport) *testClientRunner {
-	return &testClientRunner{
-		Transport: t,
-		Started:   make(chan struct{}),
-		Exited:    make(chan error, 1),
-	}
-}
-
-// Run implements clientRunner.
-func (cr *testClientRunner) Run(ctx context.Context) error {
-	close(cr.Started)
-	// Delegate to the transport's Receive (which will block or error).
-	_, err := cr.Transport.Receive(ctx)
-	cr.Exited <- err
-	return err
 }
