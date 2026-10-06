@@ -17,7 +17,7 @@ For each milestone, we distinguish:
 
 ## Detailed Assessment
 
-### M1 — A Doll Has a Terminal
+### M1 — Body Has an Identity
 **Classification**: Implemented + Tested
 **Proof**: `internal/identity/identity_test.go`
 - ✓ Local machinery: Stable persistent identity generation, marshaling/unmarshaling
@@ -41,15 +41,18 @@ For each milestone, we distinguish:
 - ✗ External conformance: Test requires root/CAP_NET_ADMIN, WireGuard tools, network namespaces - not available in standard CI
 - ✗ Blocked canonical semantics: [Known protocol hole: no direct WireGuard UDP endpoint advertised](#known-protocol-hole-no-direct-wireguard-udp-endpoint-is-advertised) blocks M3 in practice despite implementation existing
 
-### M4 — Interaction / Session Behavior
-**Classification**: Blocked by public protocol contract
-**Proof**: `PROTOCOL_HOLES.md` (M4 section)
-- ✗ Local machinery: None - cannot implement without inventing semantics
-- ✗ Unit/integration tests: None - blocked at specification level
-- ✗ External conformance: Impossible without resolving protocol hole
-- ✓ Blocked canonical semantics: Public Body Protocol v1 lacks definition for terminal text exchange; `body.event` (Body→Core only) cannot return response, `execution.request`/`execution.result` is for capability operations, not conversation text
+### M4 — Doll Link Framing/Hello/Capabilities/Ready Groundwork
+**Classification**: Implemented + Tested (groundwork)
+**Proof**: 
+- Local machinery: `internal/link/dollink_test.go`, `internal/body/dollink_*_test.go` files
+- Unit/integration tests: Multiple test files for Doll Link framing/hello/capability/ready
+- ✓ Local machinery: Doll Link framing, hello, capability exchange, ready state groundwork implemented
+- ✓ Unit/integration tests: Present for Doll Link negotiation groundwork
+- ✗ External conformance: Requires M6 (relay connectivity) for actual negotiation over network
+- ⚠️ Partially blocked: Groundwork implemented but full Doll Link wire negotiation blocked by M6 discovery hole
+- Terminal interaction/session behavior: Blocked by public protocol contract (see M4 holes below)
 
-### M5 — Explicit Capability Execution (Process/Shell Command Execution)
+### M5 — Local Host Process Executor
 **Classification**: Local machinery implemented + tested; wire mapping blocked
 **Proof**: 
 - Local machinery: `internal/execution/process/executor_test.go` (7 test functions)
@@ -59,7 +62,7 @@ For each milestone, we distinguish:
 - ✗ External conformance: Wire mapping undefined - cannot achieve conformance without inventing semantics
 - ✗ Blocked canonical semantics: Public specification names "process" as preferred capability but does NOT define canonical operations, command/argument mapping, env/stdin handling, or result semantics
 
-### M6 — Relay Connectivity (Relay UDP and Relay WSS/443)
+### M6 — Relay UDP/WSS Transport Primitives
 **Classification**: Transport primitives implemented; discovery/route selection blocked
 **Proof**: 
 - Transport primitives: Examined internal/relay/ and internal/tunnel/ code
@@ -69,48 +72,48 @@ For each milestone, we distinguish:
 - ✗ External conformance: Impossible without endpoint/route discovery mechanisms
 - ✗ Blocked canonical semantics: Public contracts do NOT specify mechanisms for Relay UDP endpoint discovery, route ID discovery/persistence, Relay WSS endpoint discovery, or direct/UDP/WSS path selection
 
-### M7 — Doll Link Negotiation
-**Classification**: Implemented + Tested (groundwork)
+### M7 — Mobility/Reconnect
+**Classification**: Implemented but not externally conformance-tested
 **Proof**: 
-- Local machinery: `internal/link/dollink_test.go`, `internal/body/dollink_*_test.go` files
-- Unit/integration tests: Multiple test files for Doll Link framing/hello/capability/ready
-- ✓ Local machinery: Doll Link framing, hello, capability exchange, ready state groundwork implemented
-- ✓ Unit/integration tests: Present for Doll Link negotiation groundwork
-- ✗ External conformance: Requires M6 (relay connectivity) for actual negotiation over network
-- ⚠️ Partially blocked: Groundwork implemented but full negotiation blocked by M6 discovery hole
+- Local machinery: `internal/body/mobility_test.go`
+- Unit/integration tests: 3 test functions for basic operation, cancellation during backoff, and 3-cycle reconnect
+- ✓ Local machinery: MobilityManager logic implemented with test transports
+- ✓ Unit/integration tests: Present for basic mobility/reconnect operation
+- ✗ External conformance: No end-to-end test proving mobility/reconnect with real Core/Relay in CI
+- ✗ Blocked canonical semantics: Actual reconnect after Core relocation remains blocked by M6 discovery hole (cannot discover migrated Core's new location)
 
-### M8 — Explicit Capability Execution
-**Classification**: Local machinery implemented + tested; wire mapping blocked (dependent on M5/M6/M7)
+### M8 — Durable Restart/Migration Groundwork
+**Classification**: Implemented + Tested (internal integration coverage)
 **Proof**: 
-- Local machinery: Same as M5 - process executor implemented
-- Wire mapping: Blocked by M5/M6/M7 per `PROTOCOL_HOLES.md`
-- ✓ Local machinery: Local process executor implemented and tested
-- ✓ Unit/integration tests: Present (same as M5)
-- ✗ External conformance: Blocked by unresolved M5 (wire mapping), M6 (relay connectivity), and M7 (Doll Link negotiation) dependencies
-- ✗ Blocked canonical semantics: Cannot achieve explicit capability execution without resolving M5 wire mapping hole
+- Local machinery: `internal/body/migration_test.go`
+- Unit/integration tests: Test proving durable state survives restart
+- ✓ Local machinery: Identity/WG key/membership persistence across restart implemented
+- ✓ Unit/integration tests: Migration test proves durable state survives restart
+- ✓ External conformance: **INTERNAL integration coverage only** - proves:
+  - durable Body identity survives restart
+  - WG identity survives restart  
+  - membership/Core relationship survives restart
+  - restored state can drive a fresh MobilityManager connection attempt
+- ✗ External conformance: Does NOT prove:
+  - actual Core migration
+  - external end-to-end migration/reconnect
+  - discovery of a relocated Core
+- ✗ Blocked canonical semantics: None - public specification allows this behavior; remaining blocks are due to M6 discovery hole
 
-### M9 — Reconnect / Mobility / Restart / Core Migration
-**Classification**: 
-- Restart/Core migration: Implemented + Tested
-- Reconnect/Mobility: Implemented but not externally conformance-tested
-**Proof**: 
-- Restart/Core migration: `internal/body/migration_test.go`, `internal/body/mobility_test.go`
-- Reconnect/Mobility: `internal/body/mobility_test.go`
-- ✓ Local machinery (restart/Core migration): Identity/WG key/membership persistence across restart implemented
-- ✓ Unit/integration tests (restart/Core migration): Migration test proves durable state survives restart
-- ✓ External conformance (restart/Core migration): Proven via test showing Body identity/WG/membership survive restart and can drive fresh MobilityManager connection attempt
-- ✗ Blocked canonical semantics (restart/Core migration): None - public specification allows this behavior
-- ✓ Local machinery (reconnect/mobility): MobilityManager logic implemented with test transports
-- ✓ Unit/integration tests (reconnect/mobility): 3 test functions for basic operation, cancellation during backoff, and 3-cycle reconnect
-- ✗ External conformance (reconnect/mobility): No end-to-end test proving mobility/reconnect with real Core/Relay in CI
-- ✗ Blocked canonical semantics (reconnect/mobility): Actual reconnect after Core relocation remains blocked by M6 discovery hole (cannot discover migrated Core's new location)
+### M9 — Conformance Baseline/Inventory
+**Classification**: This document establishes the baseline
+**Proof**: This file (`M9_CONFORMANCE_INVENTORY.md`)
+- ✓ Local machinery: Documentation of implemented/tested/blocked behavior
+- ✓ Unit/integration tests: N/A (documentation)
+- ✓ External conformance: Serves as conformance baseline by providing trustworthy account
+- ✗ Blocked: None - this document itself is the conformance deliverable
 
 ## Known Protocol Holes (Must Remain Visible)
 
 These holes are **not** presented as supported behavior and block conformance where indicated:
 
 1. **No Direct WireGuard UDP Endpoint Advertised**
-   - `--connect` requires explicit structured direct descriptor: `{ \"type\": \"direct\", \"host\": \"...\", \"port\": ..., \"transport\": \"udp\" }`
+   - `--connect` requires explicit structured direct descriptor: `{ "type": "direct", "host": "...", "port": ..., "transport": "udp" }`
    - Current public Doll Network contract (M2 pairing) advertises Core endpoints only as pairing/bootstrap URLs
    - Membership from real M2-era Core carries **no** unambiguous direct WireGuard UDP endpoint
    - `--connect` fails closed with clear protocol-hole error rather than guessing
@@ -118,13 +121,17 @@ These holes are **not** presented as supported behavior and block conformance wh
 
 2. **M4: Terminal Interaction Requires Core 5 Interaction Session Semantics**
    - As detailed above — blocks M4 interaction/session behavior
+   - Public Body Protocol v1 lacks definition for terminal text exchange; `body.event` (Body→Core only) cannot return response, `execution.request`/`execution.result` is for capability operations, not conversation text
 
 3. **M5: Process Capability Contract Hole**
    - As detailed above — blocks M5 explicit capability execution wire mapping
+   - Public specification names "process" as preferred capability but does NOT define canonical operations, command/argument mapping, env/stdin handling, or result semantics
 
 4. **M6: Relay Connectivity Requires Endpoint/Route Discovery Mechanisms**
    - As detailed above — blocks M6 Relay UDP and Relay WSS/443
-   - **Also blocks**: M7 Doll Link negotiation (requires relay connectivity) and M9 reconnect/mobility (requires discovery of relocated Core)
+   - **Also blocks**: 
+     - M7 Doll Link negotiation (requires relay connectivity for actual wire negotiation)
+     - M9 reconnect/mobility (requires discovery of relocated Core)
 
 ## Updated Protocol Version Claims
 
@@ -133,10 +140,14 @@ The Shell Body supports the following public protocol versions **as implemented 
 - **Doll Network Protocol: v1**
   - Implemented + Tested: M1 (identity), M2 (pairing)
   - Implemented but not externally conformance-tested: M3 (private path - privileged conformance test exists)
-  - Blocked by public protocol contract: M4 (interaction/session), M5 (process capability wire mapping), M6 (relay connectivity discovery)
-  - Partially implemented (groundwork): M7 (Doll Link framing/hello/capability/ready groundwork implemented)
-  - Not implemented for wire execution: M8 (explicit capability execution - blocked by M5/M6/M7)
-  - Partially implemented: M9 (restart/Core migration tested; reconnect/mobility not externally tested due to M6 blocking)
+  - Blocked by public protocol contract: 
+    - M4 (terminal interaction/session behavior)
+    - M5 (process capability wire mapping)
+    - M6 (relay connectivity discovery)
+    - M9 reconnect/mobility (due to M6 blocking discovery of relocated Core)
+  - Partially implemented (groundwork): 
+    - M4 (Doll Link framing/hello/capability/ready groundwork implemented)
+    - M8 (durable restart/migration groundwork - internal integration coverage only)
 
 - **Doll Link Protocol: v1**
   - **Not implemented for wire negotiation** — Shell Body does not implement Doll Link (`body.hello` over a connection) due to M6 blocking
@@ -149,8 +160,8 @@ The Shell Body has established a conformance baseline for M9 by:
 
 1. **Honestly implementing and testing** what the public specifications allow without inventing contracts
 2. **Clearly distinguishing** local machinery from external conformance proof
-3. **Accurately marking** what is blocked by public protocol holes (M4, M5, M6, and M9 reconnect/mobility due to M6)
-4. **Acknowledging implemented groundwork** where appropriate (M7 Doll Link framing/hello/capability/ready)
+3. **Accurately marking** what is blocked by public protocol holes (M4 interaction, M5 wire mapping, M6 discovery, and M9 reconnect/mobility due to M6)
+4. **Acknowledging implemented groundwork** where appropriate (M4 Doll Link groundwork, M8 restart/migration groundwork)
 5. **Providing test pointers** for all implemented+tested claims
 
 This inventory satisfies M9's goal: "Turn Shell Body into a boring, trustworthy external conformance client" by providing a trustworthy account of what the Shell Body can and cannot do based solely on public protocol specifications.
