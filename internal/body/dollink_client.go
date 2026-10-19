@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Neon-Dolls/neondoll-shellbody/internal/link"
@@ -61,31 +62,57 @@ type Client struct {
 	sessionOpened bool
 	// onSessionEvent is called when a session.event is received.
 	onSessionEvent func(ctx context.Context, ev link.SessionEventPayload) error
-	// nextTerminalSequence is the next sequence number to use for terminal input.
-	nextTerminalSequence uint64
-	// lastTerminalResponse holds the most recent terminal response received.
-	lastTerminalResponse string
-	// lastTerminalResponseSequence holds the sequence number of the last response.
-	lastTerminalResponseSequence uint64
-	// terminalResponseCh delivers terminal responses (string lines) to
-	// ReceiveTerminalResponse. It is fed by handleMessage, so the transport has
-	// a single receiver (the run loop).
+	// ---- Terminal session I/O ----
+	//
+	// The remote terminal session uses a single-outstanding-request contract:
+	// at most one input request may be in flight at a time, and a request is
+	// outstanding until all of its responses have been consumed from the
+	// buffer. The wire protocol carries a monotonic sequence number, but we do
+	// NOT claim sequence-based response correlation — responses are delivered
+	// in arrival order through a single bounded FIFO.
+
+	// nextTerminalSequence is monotonically increased for each input request.
+	// It is allocated atomically so concurrent senders never collide.
+	nextTerminalSequence atomic.Uint64
+	// terminalMu guards the terminal response buffer and in-flight state.
+	terminalMu sync.Mutex
+	// terminalInFlight is true while an input request is awaiting responses.
+	// It enforces the single-outstanding-request contract.
+	terminalInFlight bool
+	// terminalOverflowed latches an explicit overflow failure: a
+	// terminal_output arrived while the bounded buffer was full and was not
+	// delivered. ReceiveTerminalResponse surfaces it exactly once instead of
+	// silently dropping it.
+	terminalOverflowed bool
+	// terminalResponseCh delivers terminal response lines (FIFO) to caller
+	// goroutines. It is fed, non-blocking, by handleMessage on the run loop
+	// (the single transport receiver). Capacity is bounded by
+	// terminalResponseBufferSize; when full, overflow is latched explicitly.
 	terminalResponseCh chan string
-	// terminalResponseMutex protects access to the terminal response fields.
-	terminalResponseMutex sync.Mutex
+	// terminalSessionDone is closed when the terminal session closes or
+	// changes, waking any goroutine blocked in ReceiveTerminalResponse. It is
+	// recreated for each new session.
+	terminalSessionDone chan struct{}
 }
+
+// terminalResponseBufferSize bounds how many terminal output lines may be
+// queued before ReceiveTerminalResponse must drain. A larger buffer smooths
+// bursts of terminal output; when full, additional output is never silently
+// dropped — overflow is latched and surfaced as an explicit error.
+const terminalResponseBufferSize = 16
 
 // NewClient creates a new Body client with the given transport and Body ID.
 func NewClient(t Transport, bodyID string) *Client {
 	return &Client{
-		Transport:          t,
-		BodyID:             bodyID,
-		BodyType:           "shell",
-		Implementation:     "neondoll-shellbody",
-		Platform:           runtime.GOOS,
-		Architecture:       runtime.GOARCH,
-		done:               make(chan struct{}),
-		terminalResponseCh: make(chan string, 1),
+		Transport:           t,
+		BodyID:              bodyID,
+		BodyType:            "shell",
+		Implementation:      "neondoll-shellbody",
+		Platform:            runtime.GOOS,
+		Architecture:        runtime.GOARCH,
+		done:                make(chan struct{}),
+		terminalResponseCh:  make(chan string, terminalResponseBufferSize),
+		terminalSessionDone: make(chan struct{}),
 	}
 }
 
@@ -124,17 +151,57 @@ func (c *Client) isReady() bool {
 	return c.ready
 }
 
+// ErrTerminalSessionNotOpened is returned by SendTerminalInput when no
+// terminal session is currently open.
+var ErrTerminalSessionNotOpened = errors.New("cannot send terminal input: session not opened")
+
+// ErrTerminalRequestOutstanding is returned by SendTerminalInput when a second
+// input is sent before the previous request's responses have been consumed.
+// Terminal input enforces a single-outstanding-request contract.
+var ErrTerminalRequestOutstanding = errors.New("terminal request already outstanding: receive the previous response before sending another input")
+
+// ErrTerminalResponseOverflow is returned by ReceiveTerminalResponse when the
+// bounded terminal output buffer filled and output was not delivered. The
+// overflow is surfaced explicitly rather than dropped silently.
+var ErrTerminalResponseOverflow = errors.New("terminal output buffer overflowed: output was not delivered")
+
+// ErrTerminalSessionClosed is returned by ReceiveTerminalResponse when the
+// terminal session closes or is replaced before a response arrives.
+var ErrTerminalSessionClosed = errors.New("terminal session closed or changed before a response arrived")
+
 // SendTerminalInput sends terminal input to the Core via session.event.
-// It blocks until the context is cancelled or an error occurs.
+// It enforces a single-outstanding-request contract: a new input is rejected
+// with ErrTerminalRequestOutstanding while a previous request's responses are
+// still pending. The sequence number is allocated atomically, so concurrent
+// callers can never observe or reuse the same number.
 func (c *Client) SendTerminalInput(ctx context.Context, input string) error {
+	// Reserve the single-in-flight slot before any I/O so concurrent sends are
+	// rejected deterministically, and allocate the sequence atomically. On any
+	// failure below the slot is released via releaseInFlight.
+	c.terminalMu.Lock()
+	if c.terminalInFlight {
+		c.terminalMu.Unlock()
+		return ErrTerminalRequestOutstanding
+	}
+	sequence := c.nextTerminalSequence.Add(1) - 1
+	c.terminalInFlight = true
+	c.terminalMu.Unlock()
+
+	release := true
+	defer func() {
+		if release {
+			c.terminalMu.Lock()
+			c.terminalInFlight = false
+			c.terminalMu.Unlock()
+		}
+	}()
+
 	c.mu.RLock()
 	sessionID := c.sessionID
 	sessionOpened := c.sessionOpened
-	sequence := c.nextTerminalSequence
 	c.mu.RUnlock()
-
 	if !sessionOpened {
-		return fmt.Errorf("cannot send terminal input: session not opened")
+		return ErrTerminalSessionNotOpened
 	}
 
 	payload := link.SessionEventPayload{
@@ -163,26 +230,67 @@ func (c *Client) SendTerminalInput(ctx context.Context, input string) error {
 		return fmt.Errorf("failed to send terminal input: %w", err)
 	}
 
-	// Increment sequence for next input
-	c.mu.Lock()
-	c.nextTerminalSequence++
-	c.mu.Unlock()
-
+	// The send succeeded; the request stays in flight until its responses are
+	// consumed via ReceiveTerminalResponse.
+	release = false
 	return nil
 }
 
-// ReceiveTerminalResponse blocks until a terminal response session.event is received
-// with the matching sequence number, or the context is cancelled.
+// ReceiveTerminalResponse returns the next terminal output line, blocking until
+// one arrives, the context is cancelled, or the terminal session closes or is
+// replaced. Responses are delivered in arrival order through a bounded buffer;
+// a saturated buffer surfaces an explicit ErrTerminalResponseOverflow rather
+// than silently dropping output.
 func (c *Client) ReceiveTerminalResponse(ctx context.Context) (string, error) {
-	// Terminal responses are delivered through terminalResponseCh by
-	// handleMessage. This keeps the transport with a single receiver (the run
-	// loop) and avoids two goroutines racing for the same receive channel.
-	select {
-	case line := <-c.terminalResponseCh:
-		return line, nil
-	case <-ctx.Done():
-		return "", ctx.Err()
+	for {
+		c.terminalMu.Lock()
+		// Surface a latched overflow exactly once, before consuming buffered
+		// lines, so a saturated buffer is reported rather than dropped.
+		if c.terminalOverflowed {
+			c.terminalOverflowed = false
+			c.terminalMu.Unlock()
+			return "", ErrTerminalResponseOverflow
+		}
+		done := c.terminalSessionDone
+		c.terminalMu.Unlock()
+
+		select {
+		case line := <-c.terminalResponseCh:
+			c.terminalMu.Lock()
+			if len(c.terminalResponseCh) == 0 {
+				c.terminalInFlight = false
+			}
+			c.terminalMu.Unlock()
+			return line, nil
+		case <-done:
+			return "", ErrTerminalSessionClosed
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
 	}
+}
+
+// resetTerminalSession clears all pending terminal state and wakes any
+// goroutine blocked in ReceiveTerminalResponse. It is called when the terminal
+// session closes or is replaced so that stale pending responses are
+// invalidated rather than delivered to the wrong session.
+func (c *Client) resetTerminalSession() {
+	c.terminalMu.Lock()
+	c.terminalInFlight = false
+	c.terminalOverflowed = false
+	// Drain any buffered responses belonging to the previous session.
+	for {
+		select {
+		case <-c.terminalResponseCh:
+		default:
+			goto drained
+		}
+	}
+drained:
+	// Wake blocked receivers; install a fresh signal for the next session.
+	close(c.terminalSessionDone)
+	c.terminalSessionDone = make(chan struct{})
+	c.terminalMu.Unlock()
 }
 
 // Run starts the client's main loop: performs hello negotiation, then processes messages.
@@ -457,6 +565,9 @@ func (c *Client) handleMessage(ctx context.Context, msg *link.Envelope) error {
 		c.sessionID = payload.SessionID
 		c.sessionOpened = true
 		c.mu.Unlock()
+		// A session open (including a replacement) invalidates any pending
+		// responses from a previous session.
+		c.resetTerminalSession()
 		return nil
 
 	case link.TypeSessionEvent:
@@ -475,19 +586,17 @@ func (c *Client) handleMessage(ctx context.Context, msg *link.Envelope) error {
 		// handler is attached.
 		if payload.Event == "terminal_output" {
 			if line, lineOk := payload.Data["line"].(string); lineOk {
-				if seqFloat, seqOk := payload.Data["sequence"].(float64); seqOk {
-					sequence := uint64(seqFloat)
-					c.terminalResponseMutex.Lock()
-					c.lastTerminalResponse = line
-					c.lastTerminalResponseSequence = sequence
-					c.terminalResponseMutex.Unlock()
-					select {
-					case c.terminalResponseCh <- line:
-					default:
-						// Buffer full: drop the oldest already-consumed
-						// response rather than block the run loop.
-					}
+				c.terminalMu.Lock()
+				select {
+				case c.terminalResponseCh <- line:
+				default:
+					// Buffer full: never drop output silently. Latch an
+					// explicit overflow failure that ReceiveTerminalResponse
+					// surfaces deterministically. The run loop must not block,
+					// so this is the bounded-overflow contract.
+					c.terminalOverflowed = true
 				}
+				c.terminalMu.Unlock()
 			}
 		}
 		h := c.onSessionEvent
@@ -505,6 +614,8 @@ func (c *Client) handleMessage(ctx context.Context, msg *link.Envelope) error {
 		c.sessionID = ""
 		c.sessionOpened = false
 		c.mu.Unlock()
+		// Closing the session invalidates any pending terminal responses.
+		c.resetTerminalSession()
 		return nil
 
 	default:
