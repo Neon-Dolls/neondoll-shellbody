@@ -55,18 +55,37 @@ type Client struct {
 	onExecutionRequest func(ctx context.Context, req link.ExecutionRequestPayload) (link.ExecutionResultPayload, error)
 	// onBodyEvent is called when a body.event is received (for observation).
 	onBodyEvent func(ctx context.Context, ev link.EventPayload) error
+	// sessionID is the current session identifier.
+	sessionID string
+	// sessionOpened indicates whether the session has been opened.
+	sessionOpened bool
+	// onSessionEvent is called when a session.event is received.
+	onSessionEvent func(ctx context.Context, ev link.SessionEventPayload) error
+	// nextTerminalSequence is the next sequence number to use for terminal input.
+	nextTerminalSequence uint64
+	// lastTerminalResponse holds the most recent terminal response received.
+	lastTerminalResponse string
+	// lastTerminalResponseSequence holds the sequence number of the last response.
+	lastTerminalResponseSequence uint64
+	// terminalResponseCh delivers terminal responses (string lines) to
+	// ReceiveTerminalResponse. It is fed by handleMessage, so the transport has
+	// a single receiver (the run loop).
+	terminalResponseCh chan string
+	// terminalResponseMutex protects access to the terminal response fields.
+	terminalResponseMutex sync.Mutex
 }
 
 // NewClient creates a new Body client with the given transport and Body ID.
 func NewClient(t Transport, bodyID string) *Client {
 	return &Client{
-		Transport:      t,
-		BodyID:         bodyID,
-		BodyType:       "shell",
-		Implementation: "neondoll-shellbody",
-		Platform:       runtime.GOOS,
-		Architecture:   runtime.GOARCH,
-		done:           make(chan struct{}),
+		Transport:          t,
+		BodyID:             bodyID,
+		BodyType:           "shell",
+		Implementation:     "neondoll-shellbody",
+		Platform:           runtime.GOOS,
+		Architecture:       runtime.GOARCH,
+		done:               make(chan struct{}),
+		terminalResponseCh: make(chan string, 1),
 	}
 }
 
@@ -103,6 +122,67 @@ func (c *Client) isReady() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.ready
+}
+
+// SendTerminalInput sends terminal input to the Core via session.event.
+// It blocks until the context is cancelled or an error occurs.
+func (c *Client) SendTerminalInput(ctx context.Context, input string) error {
+	c.mu.RLock()
+	sessionID := c.sessionID
+	sessionOpened := c.sessionOpened
+	sequence := c.nextTerminalSequence
+	c.mu.RUnlock()
+
+	if !sessionOpened {
+		return fmt.Errorf("cannot send terminal input: session not opened")
+	}
+
+	payload := link.SessionEventPayload{
+		SessionID: sessionID,
+		Event:     "terminal_input",
+		Data: map[string]interface{}{
+			"line":     input,
+			"sequence": sequence,
+		},
+	}
+
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal terminal input payload: %w", err)
+	}
+
+	event := link.Envelope{
+		Type:      link.TypeSessionEvent,
+		ID:        generateID(),
+		BodyID:    c.BodyID,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Payload:   payloadBytes,
+	}
+
+	if err := c.Transport.Send(ctx, event); err != nil {
+		return fmt.Errorf("failed to send terminal input: %w", err)
+	}
+
+	// Increment sequence for next input
+	c.mu.Lock()
+	c.nextTerminalSequence++
+	c.mu.Unlock()
+
+	return nil
+}
+
+// ReceiveTerminalResponse blocks until a terminal response session.event is received
+// with the matching sequence number, or the context is cancelled.
+func (c *Client) ReceiveTerminalResponse(ctx context.Context) (string, error) {
+	// Terminal responses are delivered through terminalResponseCh by
+	// handleMessage. This keeps the transport with a single receiver (the run
+	// loop) and avoids two goroutines racing for the same receive channel.
+	select {
+	case line := <-c.terminalResponseCh:
+		return line, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
 }
 
 // Run starts the client's main loop: performs hello negotiation, then processes messages.
@@ -366,6 +446,65 @@ func (c *Client) handleMessage(ctx context.Context, msg *link.Envelope) error {
 		if err := h(ctx, ev); err != nil {
 			return fmt.Errorf("body.event handler failed: %w", err)
 		}
+		return nil
+
+	case link.TypeSessionOpened:
+		var payload link.SessionOpenedPayload
+		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+			return fmt.Errorf("failed to unmarshal session.opened: %w", err)
+		}
+		c.mu.Lock()
+		c.sessionID = payload.SessionID
+		c.sessionOpened = true
+		c.mu.Unlock()
+		return nil
+
+	case link.TypeSessionEvent:
+		var payload link.SessionEventPayload
+		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+			return fmt.Errorf("failed to unmarshal session.event: %w", err)
+		}
+		c.mu.RLock()
+		if c.sessionID != payload.SessionID {
+			c.mu.RUnlock()
+			return fmt.Errorf("session.event with mismatched session ID: expected %s, got %s", c.sessionID, payload.SessionID)
+		}
+		c.mu.RUnlock()
+		// Handle terminal_output events by delivering the response to
+		// ReceiveTerminalResponse regardless of whether a session-event
+		// handler is attached.
+		if payload.Event == "terminal_output" {
+			if line, lineOk := payload.Data["line"].(string); lineOk {
+				if seqFloat, seqOk := payload.Data["sequence"].(float64); seqOk {
+					sequence := uint64(seqFloat)
+					c.terminalResponseMutex.Lock()
+					c.lastTerminalResponse = line
+					c.lastTerminalResponseSequence = sequence
+					c.terminalResponseMutex.Unlock()
+					select {
+					case c.terminalResponseCh <- line:
+					default:
+						// Buffer full: drop the oldest already-consumed
+						// response rather than block the run loop.
+					}
+				}
+			}
+		}
+		h := c.onSessionEvent
+		if h == nil {
+			return nil
+		}
+		return h(ctx, payload)
+
+	case link.TypeSessionClose:
+		var payload link.SessionClosePayload
+		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+			return fmt.Errorf("failed to unmarshal session.close: %w", err)
+		}
+		c.mu.Lock()
+		c.sessionID = ""
+		c.sessionOpened = false
+		c.mu.Unlock()
 		return nil
 
 	default:
