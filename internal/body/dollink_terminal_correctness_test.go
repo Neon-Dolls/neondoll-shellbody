@@ -2,6 +2,8 @@
 // client. These cover the single-outstanding-request contract, atomic sequence
 // allocation under contention, bounded-buffer overflow behavior, multiple
 // outputs, and pending-response invalidation on session close/change.
+// Additional regression test for the terminal lifecycle issue where a command
+// produces output in multiple bursts separated by time.
 package body
 
 import (
@@ -344,3 +346,76 @@ func TestTerminalSessionReplacement(t *testing.T) {
 		t.Fatalf("expected session-not-opened error after close, got: %v", err)
 	}
 }
+
+// TestTerminalLifecycleMultiBurst verifies that a command producing output in
+// multiple bursts separated by time does not permit a second input to interleave
+// before completion (i.e., before all bursts are delivered). This enforces the
+// explicit request-completion boundary: terminalInFlight remains true until the
+// final burst is consumed.
+func TestTerminalLifecycleMultiBurst(t *testing.T) {
+	h := startTermHarness(t, "sess_l")
+	defer h.cancel()
+
+	h.waitSessionActive(t)
+
+	// === FIRST INPUT (multi-burst response) ===
+	if err := h.client.SendTerminalInput(h.ctx, "first"); err != nil {
+		t.Fatalf("SendTerminalInput first: %v", err)
+	}
+	h.waitInput(t) // peer saw the input
+
+	// Deliver first burst of output (two lines)
+	h.deliver(t, link.TypeSessionEvent, outputEvent("sess_l", "burst1-line1\n", 0))
+	h.deliver(t, link.TypeSessionEvent, outputEvent("sess_l", "burst1-line2\n", 1))
+
+	// Attempt a SECOND input while the first is still considered in flight
+	// (we have not yet drained the delivered bursts). This must be rejected.
+	err2 := h.client.SendTerminalInput(h.ctx, "second")
+	if !errors.Is(err2, ErrTerminalRequestOutstanding) {
+		t.Fatalf("expected second send to be rejected while first is in flight, got: %v", err2)
+	}
+
+	// Now deliver the second burst (one line) after a pause to simulate
+	// processing delay.
+	time.Sleep(10 * time.Millisecond) // simulate gap between bursts
+	h.deliver(t, link.TypeSessionEvent, outputEvent("sess_l", "burst2-line1\n", 2))
+
+	// Drain all three lines; only after the third is consumed should
+	// terminalInFlight become false, permitting a new input.
+	var lines []string
+	for i := 0; i < 3; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		line, err := h.client.ReceiveTerminalResponse(ctx)
+		cancel()
+		if err != nil {
+			t.Fatalf("ReceiveTerminalResponse[%d]: %v", i, err)
+		}
+		lines = append(lines, line)
+	}
+	want := []string{"burst1-line1\n", "burst1-line2\n", "burst2-line1\n"}
+	if !equalSlice(lines, want) {
+		t.Fatalf("unexpected terminal output lines: got %v, want %v", lines, want)
+	}
+
+	// After draining, a new input should succeed.
+	if err := h.client.SendTerminalInput(h.ctx, "third"); err != nil {
+		t.Fatalf("SendTerminalInput third after drain: %v", err)
+	}
+	h.waitInput(t) // peer saw the third input
+
+	// Deliver a single line for the third command.
+	h.deliver(t, link.TypeSessionEvent, outputEvent("sess_l", "third-line1\n", 0))
+
+	// Drain it.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	line, err := h.client.ReceiveTerminalResponse(ctx)
+	cancel()
+	if err != nil {
+		t.Fatalf("ReceiveTerminalResponse third: %v", err)
+	}
+	if line != "third-line1\n" {
+		t.Fatalf("third output line = %q, want %q", line, "third-line1\n")
+	}
+}
+
+// equalSlice reports whether a and b contain the same strings in the same order.
