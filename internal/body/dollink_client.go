@@ -64,25 +64,20 @@ type Client struct {
 	onSessionEvent func(ctx context.Context, ev link.SessionEventPayload) error
 	// ---- Terminal session I/O ----
 	//
-	// The remote terminal session uses a single-outstanding-request contract:
-	// at most one input request may be in flight at a time. The protocol does
-	// NOT carry a per-command completion signal, so a request stays outstanding
-	// until a legitimate session lifecycle boundary — session opened / closed /
-	// replaced, handled by resetTerminalSession. The response buffer is a
-	// shallow deliverable; draining it does NOT mean the command finished (a
-	// single input may yield multiple output events separated by time). The
-	// wire protocol carries a monotonic sequence number, but we do NOT claim
-	// sequence-based response correlation — responses are delivered in arrival
-	// order through a single bounded FIFO.
+	// Terminal interaction is modeled as a stream of events within an active
+	// Interaction Session. Sending an input does NOT await a per-command
+	// "completion": the protocol carries no completion or correlation signal,
+	// and output is NOT assumed to belong to a particular input. Successive
+	// inputs may be sent freely while the session is open — each is an
+	// independent session.event. Received output is delivered in arrival order
+	// through a single bounded FIFO. The wire carries a monotonic sequence
+	// number per input, but we do NOT claim sequence-based response correlation.
 
-	// nextTerminalSequence is monotonically increased for each input request.
+	// nextTerminalSequence is monotonically increased for each input event.
 	// It is allocated atomically so concurrent senders never collide.
 	nextTerminalSequence atomic.Uint64
-	// terminalMu guards the terminal response buffer and in-flight state.
+	// terminalMu guards the terminal response buffer and overflow latch.
 	terminalMu sync.Mutex
-	// terminalInFlight is true while an input request is awaiting responses.
-	// It enforces the single-outstanding-request contract.
-	terminalInFlight bool
 	// terminalOverflowed latches an explicit overflow failure: a
 	// terminal_output arrived while the bounded buffer was full and was not
 	// delivered. ReceiveTerminalResponse surfaces it exactly once instead of
@@ -159,11 +154,6 @@ func (c *Client) isReady() bool {
 // terminal session is currently open.
 var ErrTerminalSessionNotOpened = errors.New("cannot send terminal input: session not opened")
 
-// ErrTerminalRequestOutstanding is returned by SendTerminalInput when a second
-// input is sent before the previous request's responses have been consumed.
-// Terminal input enforces a single-outstanding-request contract.
-var ErrTerminalRequestOutstanding = errors.New("terminal request already outstanding: receive the previous response before sending another input")
-
 // ErrTerminalResponseOverflow is returned by ReceiveTerminalResponse when the
 // bounded terminal output buffer filled and output was not delivered. The
 // overflow is surfaced explicitly rather than dropped silently.
@@ -173,32 +163,17 @@ var ErrTerminalResponseOverflow = errors.New("terminal output buffer overflowed:
 // terminal session closes or is replaced before a response arrives.
 var ErrTerminalSessionClosed = errors.New("terminal session closed or changed before a response arrived")
 
-// SendTerminalInput sends terminal input to the Core via session.event.
-// It enforces a single-outstanding-request contract: a new input is rejected
-// with ErrTerminalRequestOutstanding while a previous request's responses are
-// still pending. The sequence number is allocated atomically, so concurrent
-// callers can never observe or reuse the same number.
+// SendTerminalInput streams a line of terminal input to the Core for the
+// active Interaction Session via session.event ("terminal_input"). Input is a
+// stream of independent events within an open session, NOT a request awaiting
+// per-command completion: successive inputs may be sent at any time while the
+// session is open, and output is returned separately (in arrival order) by
+// ReceiveTerminalResponse. The protocol carries no completion or correlation
+// signal, so we do not attribute any particular output to a particular input.
+// Each input is assigned an atomically-increasing sequence number so concurrent
+// senders never reuse one.
 func (c *Client) SendTerminalInput(ctx context.Context, input string) error {
-	// Reserve the single-in-flight slot before any I/O so concurrent sends are
-	// rejected deterministically, and allocate the sequence atomically. On any
-	// failure below the slot is released via releaseInFlight.
-	c.terminalMu.Lock()
-	if c.terminalInFlight {
-		c.terminalMu.Unlock()
-		return ErrTerminalRequestOutstanding
-	}
 	sequence := c.nextTerminalSequence.Add(1) - 1
-	c.terminalInFlight = true
-	c.terminalMu.Unlock()
-
-	release := true
-	defer func() {
-		if release {
-			c.terminalMu.Lock()
-			c.terminalInFlight = false
-			c.terminalMu.Unlock()
-		}
-	}()
 
 	c.mu.RLock()
 	sessionID := c.sessionID
@@ -230,14 +205,7 @@ func (c *Client) SendTerminalInput(ctx context.Context, input string) error {
 		Payload:   payloadBytes,
 	}
 
-	if err := c.Transport.Send(ctx, event); err != nil {
-		return fmt.Errorf("failed to send terminal input: %w", err)
-	}
-
-	// The send succeeded; the request stays in flight until its responses are
-	// consumed via ReceiveTerminalResponse.
-	release = false
-	return nil
+	return c.Transport.Send(ctx, event)
 }
 
 // ReceiveTerminalResponse returns the next terminal output line, blocking until
@@ -246,13 +214,13 @@ func (c *Client) SendTerminalInput(ctx context.Context, input string) error {
 // a saturated buffer surfaces an explicit ErrTerminalResponseOverflow rather
 // than silently dropping output.
 //
-// Drain-boundary note: an empty response channel is NOT treated as command
-// completion. The Doll Link protocol carries neither a per-command end marker
-// nor a completion signal, so a single input may yield multiple output events
-// separated by time. The request therefore stays outstanding (terminalInFlight
-// remains true) until a legitimate session lifecycle boundary — session.open /
-// session.opened / session.close via resetTerminalSession — which is the fail-
-// closed behavior: a second input cannot interleave before that boundary.
+// Drain-boundary note: an empty response channel is NOT treated as a command
+// completion signal. The Doll Link protocol carries neither a per-command end
+// marker nor a correlation token, so output is delivered purely in arrival
+// order and must not be attributed to a particular input. Terminal input is a
+// stream of independent session events; ReceiveTerminalResponse returns output
+// as it arrives and returns ErrTerminalSessionClosed when the session closes or
+// is replaced (via resetTerminalSession) or its context is cancelled.
 func (c *Client) ReceiveTerminalResponse(ctx context.Context) (string, error) {
 	for {
 		c.terminalMu.Lock()
@@ -283,7 +251,6 @@ func (c *Client) ReceiveTerminalResponse(ctx context.Context) (string, error) {
 // invalidated rather than delivered to the wrong session.
 func (c *Client) resetTerminalSession() {
 	c.terminalMu.Lock()
-	c.terminalInFlight = false
 	c.terminalOverflowed = false
 	// Drain any buffered responses belonging to the previous session.
 	for {

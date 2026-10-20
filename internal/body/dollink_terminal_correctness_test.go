@@ -1,9 +1,8 @@
 // Correctness regression tests for terminal session I/O in the Doll Link
-// client. These cover the single-outstanding-request contract, atomic sequence
-// allocation under contention, bounded-buffer overflow behavior, multiple
-// outputs, and pending-response invalidation on session close/change.
-// Additional regression test for the terminal lifecycle issue where a command
-// produces output in multiple bursts separated by time.
+// client. These cover the stream-of-events model (successive inputs and
+// interleaved output within one session), atomic sequence allocation under
+// contention, bounded-buffer overflow behavior, multiple outputs, and
+// pending-response invalidation on session close/change.
 package body
 
 import (
@@ -175,6 +174,22 @@ func (h *termHarness) waitInput(t *testing.T) {
 	}
 }
 
+// waitNInputs blocks until the peer has observed exactly n terminal_input
+// events. It is used after concurrent sends to confirm every event reached the
+// transport in the stream model.
+func (h *termHarness) waitNInputs(n int) error {
+	deadline := time.After(5 * time.Second)
+	for seen := 0; seen < n; {
+		select {
+		case <-h.inputSeen:
+			seen++
+		case <-deadline:
+			return fmt.Errorf("peer saw %d of %d terminal_input events", seen, n)
+		}
+	}
+	return nil
+}
+
 // outputEvent constructs a terminal_output session event payload.
 func outputEvent(sessionID, line string, seq int) map[string]interface{} {
 	return map[string]interface{}{
@@ -184,11 +199,11 @@ func outputEvent(sessionID, line string, seq int) map[string]interface{} {
 	}
 }
 
-// TestTerminalConcurrentInput verifies the single-outstanding-request gate is
-// deterministic under contention: concurrent SendTerminalInput calls have
-// exactly one success; every other caller gets ErrTerminalRequestOutstanding.
-// The atomic sequence allocation is exercised because the slot is reserved and
-// sequenced atomically under the same lock.
+// TestTerminalConcurrentInput verifies that concurrent SendTerminalInput calls
+// all succeed: terminal input is a stream of independent events, so there is no
+// single-outstanding gate to contend for. Each concurrent caller gets its own
+// atomically-allocated sequence number and its own delivered event, so no caller
+// is rejected and no sequence collides.
 func TestTerminalConcurrentInput(t *testing.T) {
 	h := startTermHarness(t, "sess_c")
 	defer h.cancel()
@@ -207,19 +222,22 @@ func TestTerminalConcurrentInput(t *testing.T) {
 	}
 	wg.Wait()
 
-	successes := 0
-	for _, e := range errs {
-		switch {
-		case e == nil:
-			successes++
-		case errors.Is(e, ErrTerminalRequestOutstanding):
-			// expected under single-outstanding
-		default:
-			t.Fatalf("unexpected concurrent send error: %v", e)
+	// Every concurrent send must succeed — there is no in-flight gate.
+	for i, e := range errs {
+		if e != nil {
+			t.Fatalf("concurrent send %d failed: %v", i, e)
 		}
 	}
-	if successes != 1 {
-		t.Fatalf("expected exactly 1 successful concurrent send, got %d", successes)
+
+	// All `goroutines` events must have reached the peer.
+	if err := h.waitNInputs(goroutines); err != nil {
+		t.Fatalf("peer did not receive all %d inputs: %v", goroutines, err)
+	}
+
+	// The atomic allocator issued exactly as many unique sequence numbers as
+	// there were concurrent senders.
+	if got := h.client.nextTerminalSequence.Load(); got != goroutines {
+		t.Fatalf("expected %d sequences allocated, got %d", goroutines, got)
 	}
 }
 
@@ -347,98 +365,146 @@ func TestTerminalSessionReplacement(t *testing.T) {
 	}
 }
 
-// TestTerminalLifecycleMultiBurst reproduces the request-completion bug: a
-// single input may yield multiple output bursts separated by time, and an empty
-// response buffer does NOT mean the command finished. The protocol carries no
-// per-command completion signal, so the request stays outstanding until a
-// legitimate session lifecycle boundary (session.opened / session.close / a
-// replacement session). The test:
-//  1. sends an input and delivers burst 1;
-//  2. drains burst 1 COMPLETELY, so the response buffer is empty;
-//  3. BEFORE burst 2 arrives, attempts a second input — the buffer being empty
-//     must NOT clear the outstanding request, so the second input is rejected;
-//  4. delivers and consumes burst 2, confirming all output arrives in order and
-//     is attributable to the first command;
-//  5. confirms that even after all output is consumed, the request remains
-//     outstanding (a documented conservative limitation) until a lifecycle
-//     boundary — here a session close — resets it.
-func TestTerminalLifecycleMultiBurst(t *testing.T) {
-	h := startTermHarness(t, "sess_l")
+// TestTerminalStreamSuccessiveInputs verifies the stream model: successive
+// terminal inputs are sent independently within one session without any
+// completion gate. The protocol carries no per-command completion signal, so a
+// second input is accepted immediately, and output for both inputs arrives in
+// arrival order through the shared FIFO.
+func TestTerminalStreamSuccessiveInputs(t *testing.T) {
+	h := startTermHarness(t, "sess_s")
 	defer h.cancel()
 
 	h.waitSessionActive(t)
 
-	// === FIRST INPUT (multi-burst response) ===
-	if err := h.client.SendTerminalInput(h.ctx, "first"); err != nil {
-		t.Fatalf("SendTerminalInput first: %v", err)
-	}
-	h.waitInput(t) // peer saw the input
-
-	// Deliver burst 1 of output (two lines).
-	h.deliver(t, link.TypeSessionEvent, outputEvent("sess_l", "burst1-line1\n", 0))
-	h.deliver(t, link.TypeSessionEvent, outputEvent("sess_l", "burst1-line2\n", 1))
-
-	// Drain burst 1 COMPLETELY. This empties the response buffer — the exact
-	// point where the previous (buggy) logic treated buffer emptiness as
-	// command completion and cleared terminalInFlight.
-	var burst1 []string
-	for i := 0; i < 2; i++ {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		line, err := h.client.ReceiveTerminalResponse(ctx)
-		cancel()
-		if err != nil {
-			t.Fatalf("ReceiveTerminalResponse burst1[%d]: %v", i, err)
+	// Send three inputs back-to-back while the session stays open. Each must
+	// succeed immediately — there is no single-outstanding gate to block them.
+	for _, in := range []string{"one", "two", "three"} {
+		if err := h.client.SendTerminalInput(h.ctx, in); err != nil {
+			t.Fatalf("SendTerminalInput(%q) must succeed in stream model: %v", in, err)
 		}
-		burst1 = append(burst1, line)
 	}
-	want1 := []string{"burst1-line1\n", "burst1-line2\n"}
-	if !equalSlice(burst1, want1) {
-		t.Fatalf("burst1 output = %v, want %v", burst1, want1)
-	}
-	// The response buffer is now empty, but burst 2 has NOT yet arrived.
-
-	// Attempt a SECOND input BEFORE burst 2 arrives. The first request is still
-	// outstanding (empty buffer is not completion), so this MUST be rejected.
-	err2 := h.client.SendTerminalInput(h.ctx, "second")
-	if !errors.Is(err2, ErrTerminalRequestOutstanding) {
-		t.Fatalf("second send must be rejected while first request is outstanding (buffer empty != command done), got: %v", err2)
+	if err := h.waitNInputs(3); err != nil {
+		t.Fatalf("wait for 3 inputs: %v", err)
 	}
 
-	// Now deliver and consume burst 2 (one line). It must still be delivered in
-	// arrival order behind burst 1, all attributable to the first command, with
-	// no interleaved second command.
-	h.deliver(t, link.TypeSessionEvent, outputEvent("sess_l", "burst2-line1\n", 2))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	line2, err := h.client.ReceiveTerminalResponse(ctx)
-	cancel()
+	// Deliver output for all three in arrival order; the client must surface
+	// every line, in order, regardless of which input it "belongs" to.
+	for i, out := range []string{"out-one\n", "out-two\n", "out-three\n"} {
+		h.deliver(t, link.TypeSessionEvent, outputEvent("sess_s", out, i))
+	}
+	seen, err := h.collectOutput(3, 5*time.Second)
 	if err != nil {
-		t.Fatalf("ReceiveTerminalResponse burst2: %v", err)
+		t.Fatalf("collect successive output: %v", err)
 	}
-	if line2 != "burst2-line1\n" {
-		t.Fatalf("burst2 output = %q, want %q", line2, "burst2-line1\n")
+	want := []string{"out-one\n", "out-two\n", "out-three\n"}
+	if !equalSlice(seen, want) {
+		t.Fatalf("successive output = %v, want %v", seen, want)
+	}
+}
+
+// TestTerminalStreamInterleavedOutput verifies that output from multiple inputs
+// interleaved over the wire is delivered strictly in arrival order — the client
+// never reorders, drops, or attributes a line to a specific input (the protocol
+// has no correlation token).
+func TestTerminalStreamInterleavedOutput(t *testing.T) {
+	h := startTermHarness(t, "sess_i")
+	defer h.cancel()
+
+	h.waitSessionActive(t)
+
+	// Two inputs outstanding; their output interleaves (a1, b1, a2, b2).
+	if err := h.client.SendTerminalInput(h.ctx, "a"); err != nil {
+		t.Fatalf("SendTerminalInput(a): %v", err)
+	}
+	if err := h.client.SendTerminalInput(h.ctx, "b"); err != nil {
+		t.Fatalf("SendTerminalInput(b): %v", err)
+	}
+	if err := h.waitNInputs(2); err != nil {
+		t.Fatalf("wait for 2 inputs: %v", err)
 	}
 
-	// All output for the first command has now been consumed, yet the request
-	// is STILL outstanding: the protocol has no completion signal, so the
-	// conservative behavior is that it stays in flight until a lifecycle
-	// boundary. A further send before that boundary is still rejected.
-	err2b := h.client.SendTerminalInput(h.ctx, "still-blocked")
-	if !errors.Is(err2b, ErrTerminalRequestOutstanding) {
-		t.Fatalf("send after draining all output must still be rejected (request outstanding until lifecycle boundary), got: %v", err2b)
+	for i, out := range []string{"a1\n", "b1\n", "a2\n", "b2\n"} {
+		h.deliver(t, link.TypeSessionEvent, outputEvent("sess_i", out, i))
+	}
+	seen, err := h.collectOutput(4, 5*time.Second)
+	if err != nil {
+		t.Fatalf("collect interleaved output: %v", err)
+	}
+	want := []string{"a1\n", "b1\n", "a2\n", "b2\n"}
+	if !equalSlice(seen, want) {
+		t.Fatalf("interleaved output = %v, want %v", seen, want)
+	}
+}
+
+// TestTerminalReconnect verifies reconnect behavior: after a session closes, a
+// freshly opened session accepts terminal input again, and pending output from
+// the previous session is invalidated rather than delivered to the new one.
+func TestTerminalReconnect(t *testing.T) {
+	h := startTermHarness(t, "sess_r1")
+	defer h.cancel()
+
+	h.waitSessionActive(t)
+	if err := h.client.SendTerminalInput(h.ctx, "first-session"); err != nil {
+		t.Fatalf("SendTerminalInput in first session: %v", err)
+	}
+	if err := h.waitNInputs(1); err != nil {
+		t.Fatalf("peer did not see first-session input: %v", err)
 	}
 
-	// The legitimate lifecycle boundary: closing the session resets the
-	// outstanding request. After close, the session is no longer active, so a
-	// send is rejected for a different (session-not-opened) reason — proving the
-	// in-flight slot was released by the boundary.
-	h.deliver(t, link.TypeSessionClose, map[string]interface{}{"session_id": "sess_l"})
-	err3 := h.client.SendTerminalInput(h.ctx, "after-close")
-	if !errors.Is(err3, ErrTerminalRequestOutstanding) &&
-		!errors.Is(err3, ErrTerminalSessionNotOpened) &&
-		!strings.Contains(err3.Error(), "session not opened") {
-		t.Fatalf("send after session close must be rejected (outstanding reset then no active session), got: %v", err3)
+	// Close the first session; outstanding receive must wake with a close error.
+	h.deliver(t, link.TypeSessionClose, map[string]interface{}{"session_id": "sess_r1"})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_, err := h.client.ReceiveTerminalResponse(ctx)
+	cancel()
+	if !errors.Is(err, ErrTerminalSessionClosed) {
+		t.Fatalf("expected ErrTerminalSessionClosed after close, got: %v", err)
+	}
+
+	// A send while no session is open must be rejected.
+	err = h.client.SendTerminalInput(h.ctx, "orphan")
+	if !errors.Is(err, ErrTerminalSessionNotOpened) && !strings.Contains(err.Error(), "session not opened") {
+		t.Fatalf("expected session-not-opened after close, got: %v", err)
+	}
+
+	// Reconnect: a new session opens with a fresh session ID.
+	h.deliver(t, link.TypeSessionOpened, map[string]interface{}{
+		"session_id": "sess_r2", "capability": "terminal",
+	})
+	h.waitSessionActive(t)
+
+	// The new session must accept input and deliver output in arrival order.
+	if err := h.client.SendTerminalInput(h.ctx, "second-session"); err != nil {
+		t.Fatalf("SendTerminalInput in reconnected session: %v", err)
+	}
+	if err := h.waitNInputs(1); err != nil {
+		t.Fatalf("peer did not see reconnected-session input: %v", err)
+	}
+	h.deliver(t, link.TypeSessionEvent, outputEvent("sess_r2", "hello-again\n", 0))
+	line, err := h.client.ReceiveTerminalResponse(h.ctx)
+	if err != nil {
+		t.Fatalf("ReceiveTerminalResponse in reconnected session: %v", err)
+	}
+	if line != "hello-again\n" {
+		t.Fatalf("reconnected output = %q, want %q", line, "hello-again\n")
 	}
 }
 
 // equalSlice reports whether a and b contain the same strings in the same order.
+// (Implemented in mobility_test.go within this package.)
+
+// collectOutput drains n terminal output lines from ReceiveTerminalResponse,
+// returning them in arrival order or the first error encountered.
+func (h *termHarness) collectOutput(n int, timeout time.Duration) ([]string, error) {
+	var out []string
+	deadline := time.Now().Add(timeout)
+	for len(out) < n {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Until(deadline))
+		line, err := h.client.ReceiveTerminalResponse(ctx)
+		cancel()
+		if err != nil {
+			return out, fmt.Errorf("ReceiveTerminalResponse: %w", err)
+		}
+		out = append(out, line)
+	}
+	return out, nil
+}
