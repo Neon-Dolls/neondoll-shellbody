@@ -65,11 +65,15 @@ type Client struct {
 	// ---- Terminal session I/O ----
 	//
 	// The remote terminal session uses a single-outstanding-request contract:
-	// at most one input request may be in flight at a time, and a request is
-	// outstanding until all of its responses have been consumed from the
-	// buffer. The wire protocol carries a monotonic sequence number, but we do
-	// NOT claim sequence-based response correlation — responses are delivered
-	// in arrival order through a single bounded FIFO.
+	// at most one input request may be in flight at a time. The protocol does
+	// NOT carry a per-command completion signal, so a request stays outstanding
+	// until a legitimate session lifecycle boundary — session opened / closed /
+	// replaced, handled by resetTerminalSession. The response buffer is a
+	// shallow deliverable; draining it does NOT mean the command finished (a
+	// single input may yield multiple output events separated by time). The
+	// wire protocol carries a monotonic sequence number, but we do NOT claim
+	// sequence-based response correlation — responses are delivered in arrival
+	// order through a single bounded FIFO.
 
 	// nextTerminalSequence is monotonically increased for each input request.
 	// It is allocated atomically so concurrent senders never collide.
@@ -241,6 +245,14 @@ func (c *Client) SendTerminalInput(ctx context.Context, input string) error {
 // replaced. Responses are delivered in arrival order through a bounded buffer;
 // a saturated buffer surfaces an explicit ErrTerminalResponseOverflow rather
 // than silently dropping output.
+//
+// Drain-boundary note: an empty response channel is NOT treated as command
+// completion. The Doll Link protocol carries neither a per-command end marker
+// nor a completion signal, so a single input may yield multiple output events
+// separated by time. The request therefore stays outstanding (terminalInFlight
+// remains true) until a legitimate session lifecycle boundary — session.open /
+// session.opened / session.close via resetTerminalSession — which is the fail-
+// closed behavior: a second input cannot interleave before that boundary.
 func (c *Client) ReceiveTerminalResponse(ctx context.Context) (string, error) {
 	for {
 		c.terminalMu.Lock()
@@ -256,11 +268,6 @@ func (c *Client) ReceiveTerminalResponse(ctx context.Context) (string, error) {
 
 		select {
 		case line := <-c.terminalResponseCh:
-			c.terminalMu.Lock()
-			if len(c.terminalResponseCh) == 0 {
-				c.terminalInFlight = false
-			}
-			c.terminalMu.Unlock()
 			return line, nil
 		case <-done:
 			return "", ErrTerminalSessionClosed

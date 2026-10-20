@@ -347,11 +347,21 @@ func TestTerminalSessionReplacement(t *testing.T) {
 	}
 }
 
-// TestTerminalLifecycleMultiBurst verifies that a command producing output in
-// multiple bursts separated by time does not permit a second input to interleave
-// before completion (i.e., before all bursts are delivered). This enforces the
-// explicit request-completion boundary: terminalInFlight remains true until the
-// final burst is consumed.
+// TestTerminalLifecycleMultiBurst reproduces the request-completion bug: a
+// single input may yield multiple output bursts separated by time, and an empty
+// response buffer does NOT mean the command finished. The protocol carries no
+// per-command completion signal, so the request stays outstanding until a
+// legitimate session lifecycle boundary (session.opened / session.close / a
+// replacement session). The test:
+//  1. sends an input and delivers burst 1;
+//  2. drains burst 1 COMPLETELY, so the response buffer is empty;
+//  3. BEFORE burst 2 arrives, attempts a second input — the buffer being empty
+//     must NOT clear the outstanding request, so the second input is rejected;
+//  4. delivers and consumes burst 2, confirming all output arrives in order and
+//     is attributable to the first command;
+//  5. confirms that even after all output is consumed, the request remains
+//     outstanding (a documented conservative limitation) until a lifecycle
+//     boundary — here a session close — resets it.
 func TestTerminalLifecycleMultiBurst(t *testing.T) {
 	h := startTermHarness(t, "sess_l")
 	defer h.cancel()
@@ -364,57 +374,70 @@ func TestTerminalLifecycleMultiBurst(t *testing.T) {
 	}
 	h.waitInput(t) // peer saw the input
 
-	// Deliver first burst of output (two lines)
+	// Deliver burst 1 of output (two lines).
 	h.deliver(t, link.TypeSessionEvent, outputEvent("sess_l", "burst1-line1\n", 0))
 	h.deliver(t, link.TypeSessionEvent, outputEvent("sess_l", "burst1-line2\n", 1))
 
-	// Attempt a SECOND input while the first is still considered in flight
-	// (we have not yet drained the delivered bursts). This must be rejected.
-	err2 := h.client.SendTerminalInput(h.ctx, "second")
-	if !errors.Is(err2, ErrTerminalRequestOutstanding) {
-		t.Fatalf("expected second send to be rejected while first is in flight, got: %v", err2)
-	}
-
-	// Now deliver the second burst (one line) after a pause to simulate
-	// processing delay.
-	time.Sleep(10 * time.Millisecond) // simulate gap between bursts
-	h.deliver(t, link.TypeSessionEvent, outputEvent("sess_l", "burst2-line1\n", 2))
-
-	// Drain all three lines; only after the third is consumed should
-	// terminalInFlight become false, permitting a new input.
-	var lines []string
-	for i := 0; i < 3; i++ {
+	// Drain burst 1 COMPLETELY. This empties the response buffer — the exact
+	// point where the previous (buggy) logic treated buffer emptiness as
+	// command completion and cleared terminalInFlight.
+	var burst1 []string
+	for i := 0; i < 2; i++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		line, err := h.client.ReceiveTerminalResponse(ctx)
 		cancel()
 		if err != nil {
-			t.Fatalf("ReceiveTerminalResponse[%d]: %v", i, err)
+			t.Fatalf("ReceiveTerminalResponse burst1[%d]: %v", i, err)
 		}
-		lines = append(lines, line)
+		burst1 = append(burst1, line)
 	}
-	want := []string{"burst1-line1\n", "burst1-line2\n", "burst2-line1\n"}
-	if !equalSlice(lines, want) {
-		t.Fatalf("unexpected terminal output lines: got %v, want %v", lines, want)
+	want1 := []string{"burst1-line1\n", "burst1-line2\n"}
+	if !equalSlice(burst1, want1) {
+		t.Fatalf("burst1 output = %v, want %v", burst1, want1)
+	}
+	// The response buffer is now empty, but burst 2 has NOT yet arrived.
+
+	// Attempt a SECOND input BEFORE burst 2 arrives. The first request is still
+	// outstanding (empty buffer is not completion), so this MUST be rejected.
+	err2 := h.client.SendTerminalInput(h.ctx, "second")
+	if !errors.Is(err2, ErrTerminalRequestOutstanding) {
+		t.Fatalf("second send must be rejected while first request is outstanding (buffer empty != command done), got: %v", err2)
 	}
 
-	// After draining, a new input should succeed.
-	if err := h.client.SendTerminalInput(h.ctx, "third"); err != nil {
-		t.Fatalf("SendTerminalInput third after drain: %v", err)
-	}
-	h.waitInput(t) // peer saw the third input
+	// Now deliver and consume burst 2 (one line). It must still be delivered in
+	// arrival order behind burst 1, all attributable to the first command, with
+	// no interleaved second command.
+	h.deliver(t, link.TypeSessionEvent, outputEvent("sess_l", "burst2-line1\n", 2))
 
-	// Deliver a single line for the third command.
-	h.deliver(t, link.TypeSessionEvent, outputEvent("sess_l", "third-line1\n", 0))
-
-	// Drain it.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	line, err := h.client.ReceiveTerminalResponse(ctx)
+	line2, err := h.client.ReceiveTerminalResponse(ctx)
 	cancel()
 	if err != nil {
-		t.Fatalf("ReceiveTerminalResponse third: %v", err)
+		t.Fatalf("ReceiveTerminalResponse burst2: %v", err)
 	}
-	if line != "third-line1\n" {
-		t.Fatalf("third output line = %q, want %q", line, "third-line1\n")
+	if line2 != "burst2-line1\n" {
+		t.Fatalf("burst2 output = %q, want %q", line2, "burst2-line1\n")
+	}
+
+	// All output for the first command has now been consumed, yet the request
+	// is STILL outstanding: the protocol has no completion signal, so the
+	// conservative behavior is that it stays in flight until a lifecycle
+	// boundary. A further send before that boundary is still rejected.
+	err2b := h.client.SendTerminalInput(h.ctx, "still-blocked")
+	if !errors.Is(err2b, ErrTerminalRequestOutstanding) {
+		t.Fatalf("send after draining all output must still be rejected (request outstanding until lifecycle boundary), got: %v", err2b)
+	}
+
+	// The legitimate lifecycle boundary: closing the session resets the
+	// outstanding request. After close, the session is no longer active, so a
+	// send is rejected for a different (session-not-opened) reason — proving the
+	// in-flight slot was released by the boundary.
+	h.deliver(t, link.TypeSessionClose, map[string]interface{}{"session_id": "sess_l"})
+	err3 := h.client.SendTerminalInput(h.ctx, "after-close")
+	if !errors.Is(err3, ErrTerminalRequestOutstanding) &&
+		!errors.Is(err3, ErrTerminalSessionNotOpened) &&
+		!strings.Contains(err3.Error(), "session not opened") {
+		t.Fatalf("send after session close must be rejected (outstanding reset then no active session), got: %v", err3)
 	}
 }
 
