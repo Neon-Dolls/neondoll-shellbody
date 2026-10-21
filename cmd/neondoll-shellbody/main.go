@@ -22,6 +22,9 @@ import (
 
 	"github.com/Neon-Dolls/neondoll-shellbody/internal/body"
 	"github.com/Neon-Dolls/neondoll-shellbody/internal/dollnetwork"
+	"github.com/Neon-Dolls/neondoll-shellbody/internal/enrollment"
+	"github.com/Neon-Dolls/neondoll-shellbody/internal/execution"
+	"github.com/Neon-Dolls/neondoll-shellbody/internal/execution/process"
 	"github.com/Neon-Dolls/neondoll-shellbody/internal/identity"
 	"github.com/Neon-Dolls/neondoll-shellbody/internal/terminal"
 	"github.com/Neon-Dolls/neondoll-shellbody/internal/tunnel"
@@ -51,6 +54,8 @@ func run(args []string) error {
 	initMode := fs.Bool("init", false, "initialize a fresh state directory with a new Body identity and exit")
 	pairMode := fs.String("pair", "", "pair with a Core by consuming an invitation JSON file, then exit")
 	connectMode := fs.Bool("connect", false, "establish a WireGuard tunnel to the paired Core using persisted state")
+	enrollMode := fs.String("enroll", "", "enroll as a Body with a Core 4 instance by consuming an invitation JSON file (requires --core-url and --core-id)")
+	serveMode := fs.String("serve", "", "run a Core 4 Doll Link execution session against a Core ws URL (e.g. ws://host:port/ws)")
 
 	// Options.
 	stateDir := fs.String("state-dir", ".neondoll-shellbody", "directory for durable Body state")
@@ -59,6 +64,9 @@ func run(args []string) error {
 	platform := fs.String("platform", runtime.GOOS, "platform identifier")
 	arch := fs.String("arch", runtime.GOARCH, "architecture identifier")
 	build := fs.String("build", version, "build/version stamp")
+
+	coreURL := fs.String("core-url", "", "Core base HTTP URL for enrollment (e.g. http://host:port)")
+	coreID := fs.String("core-id", "", "Core identity (core_id) that is being enrolled with")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -84,6 +92,10 @@ func run(args []string) error {
 		return initStandalone(store, *name, meta)
 	case *pairMode != "":
 		return pair(store, *pairMode)
+	case *enrollMode != "":
+		return enroll(store, *enrollMode, *coreURL, *coreID)
+	case *serveMode != "":
+		return serve(store, *serveMode)
 	case *connectMode:
 		return connect(store)
 	default:
@@ -280,6 +292,117 @@ func pair(store *body.Store, invitationFile string) error {
 	fmt.Printf("core_peer_id=%s\n", res.Membership.CorePeerID)
 	fmt.Printf("core_wg_public_key=%s\n", res.Membership.CoreWGKeyB64)
 	return nil
+}
+
+// enroll consumes a Core 4 invitation and runs the canonical signed enrollment
+// redemption flow (Core 4 Body enrollment v1). On success it persists the
+// Core-minted body_id, permissions and membership reference, then exits 0.
+func enroll(store *body.Store, invitationFile, coreURL, coreID string) error {
+	if coreURL == "" || coreID == "" {
+		return errors.New("--enroll requires --core-url and --core-id")
+	}
+
+	raw, err := os.ReadFile(invitationFile)
+	if err != nil {
+		return fmt.Errorf("failed to read invitation %s: %w", invitationFile, err)
+	}
+	inv, err := body.LoadInvitation(string(raw))
+	if err != nil {
+		return fmt.Errorf("invalid invitation: %w", err)
+	}
+
+	// Load (or create) the durable enrollment Ed25519 identity.
+	enrStore := enrollment.NewStore(store.Dir())
+	var enrIdent *enrollment.Identity
+	if enrStore.HasIdentity() {
+		enrIdent, err = enrStore.LoadIdentity()
+		if err != nil {
+			return err
+		}
+	} else {
+		enrIdent, err = enrollment.NewIdentity()
+		if err != nil {
+			return err
+		}
+		if err := enrStore.SaveIdentity(enrIdent); err != nil {
+			return err
+		}
+	}
+
+	// Render the Body's WireGuard public key in the canonical Doll Network
+	// wg_public_key form (STANDARD base64 of the 32-byte X25519 key).
+	_, kp, err := store.LoadOrError()
+	if err != nil {
+		if errors.Is(err, body.ErrStateNotFound) {
+			return errors.New("run --init first to create a Body identity + WireGuard key")
+		}
+		return err
+	}
+	wgStd := kp.PublicKeyBase64()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	hc := &http.Client{Timeout: 30 * time.Second}
+	client := enrollment.NewClient(coreURL, coreID, enrIdent, wgStd, hc)
+	receipt, err := client.Redeem(ctx, inv.InvitationID, inv.InvitationSecret)
+	if err != nil {
+		return fmt.Errorf("enrollment failed: %w", err)
+	}
+
+	record := &enrollment.Record{
+		CoreID:                   receipt.CoreID,
+		BodyID:                   receipt.BodyID,
+		BodyPublicKeyFingerprint: receipt.BodyPublicKeyFingerprint,
+		MembershipReference:      receipt.MembershipReference,
+		Permissions:              receipt.Permissions,
+		Receipt:                  *receipt,
+		EnrolledAt:               time.Now(),
+	}
+	if err := enrStore.SaveRecord(record); err != nil {
+		return err
+	}
+
+	fmt.Printf("enrolled body_id=%s\n", receipt.BodyID)
+	fmt.Printf("membership_reference=%s\n", receipt.MembershipReference)
+	fmt.Printf("core_id=%s\n", receipt.CoreID)
+	fmt.Printf("permissions=%v\n", receipt.Permissions)
+	return nil
+}
+
+// serve runs a canonical Core 4 Doll Link execution session: it connects to
+// Core's /ws endpoint, advertises the Body's capabilities, and serves inbound
+// execution.request messages until the connection or the process is stopped.
+func serve(store *body.Store, wsURL string) error {
+	if wsURL == "" {
+		return errors.New("--serve requires a Core ws URL (e.g. ws://host:port/ws)")
+	}
+	enrStore := enrollment.NewStore(store.Dir())
+	record, err := enrStore.LoadRecord()
+	if err != nil {
+		if errors.Is(err, enrollment.ErrStateNotFound) {
+			return errors.New("not enrolled yet (run --enroll first)")
+		}
+		return err
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	adapter := execution.New(process.NewExecutor(), 30*time.Second)
+	sess, err := body.DialCore4(wsURL, record.BodyID, adapter)
+	if err != nil {
+		return err
+	}
+	defer sess.Close()
+
+	if err := sess.AdvertiseCapabilities(ctx, execution.Advertised()); err != nil {
+		return fmt.Errorf("failed to advertise capabilities: %w", err)
+	}
+	fmt.Printf("connected to Core 4 as body_id=%s\n", record.BodyID)
+	fmt.Printf("advertised capability: %s (operations: %v)\n",
+		execution.CapabilityProcess, execution.Advertised()[0].Operations)
+	return sess.Run(ctx)
 }
 
 // interactive loads (or on first run creates) the Body identity + WG keypair,
