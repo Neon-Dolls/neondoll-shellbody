@@ -426,27 +426,17 @@ func serve(store *body.Store, wsURL string) error {
 		CoreID:        record.CoreID,
 		CorePublicKey: ed25519.PublicKey(corePubRaw),
 	}
-	sess, err := body.DialCore4(wsURL, creds, adapter)
-	if err != nil {
-		return err
-	}
-	defer sess.Close()
-
-	accept, err := sess.Authenticate(ctx)
-	if err != nil {
-		return fmt.Errorf("Body Authentication v1 failed: %w", err)
-	}
-	if accept.Status != auth.StatusAuthenticated {
-		return fmt.Errorf("authentication not accepted by Core (status=%q)", accept.Status)
-	}
-
-	if err := sess.AdvertiseCapabilities(ctx, execution.Advertised()); err != nil {
-		return fmt.Errorf("failed to advertise capabilities: %w", err)
-	}
-	fmt.Printf("authenticated with Core as body_id=%s (session=%s)\n", record.BodyID, accept.SessionID)
-	fmt.Printf("advertised capability: %s (operations: %v)\n",
-		execution.CapabilityProcess, execution.Advertised()[0].Operations)
-	return sess.Run(ctx)
+	// Persistent connection: an enrolled Body reconnects automatically after
+	// losing its Core connection, without re-enrollment or identity loss.
+	return body.RunRecovery(ctx, body.RecoveryConfig{
+		URL:        wsURL,
+		Creds:      creds,
+		Adapter:    adapter,
+		Advertised: execution.Advertised(),
+		OnAuthenticated: func(accept *auth.Accept) {
+			fmt.Printf("authenticated with Core as body_id=%s (session=%s)\n", record.BodyID, accept.SessionID)
+		},
+	})
 }
 
 // interactive loads (or on first run creates) the Body identity + WG keypair,
