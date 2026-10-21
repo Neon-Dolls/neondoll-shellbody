@@ -87,7 +87,7 @@ func (s *Core4Session) Authenticate(ctx context.Context) (*auth.Accept, error) {
 		return nil, fmt.Errorf("body: send hello: %w", err)
 	}
 
-	msg, err := s.readFrame(ctx)
+	msg, err := s.readFrameDeadline(ctx, time.Now().Add(readDeadline))
 	if err != nil {
 		return nil, fmt.Errorf("body: read challenge: %w", err)
 	}
@@ -116,7 +116,7 @@ func (s *Core4Session) Authenticate(ctx context.Context) (*auth.Accept, error) {
 		return nil, fmt.Errorf("body: send proof: %w", err)
 	}
 
-	msg, err = s.readFrame(ctx)
+	msg, err = s.readFrameDeadline(ctx, time.Now().Add(readDeadline))
 	if err != nil {
 		return nil, fmt.Errorf("body: read accept: %w", err)
 	}
@@ -194,12 +194,39 @@ func (s *Core4Session) handleExecutionRequest(ctx context.Context, message []byt
 }
 
 func (s *Core4Session) readFrame(ctx context.Context) ([]byte, error) {
-	_ = s.conn.SetReadDeadline(time.Now().Add(readDeadline))
-	_, message, err := s.conn.ReadMessage()
-	if err != nil {
-		return nil, err
+	// An authenticated execution session may sit idle indefinitely: no read
+	// deadline. This clears any deadline armed by the authentication handshake
+	// so an idle, healthy session is never disconnected by the read timer.
+	return s.readFrameDeadline(ctx, time.Time{})
+}
+
+// readFrameDeadline reads a single inbound frame with an explicit read
+// deadline; a zero time.Time disables the deadline (used by authenticated
+// execution sessions). The read runs on a short-lived goroutine so that ctx
+// cancellation and Close interrupt a blocked read promptly: both close the
+// underlying connection, which makes the in-flight ReadMessage return, and the
+// goroutine is drained before returning so it never leaks.
+func (s *Core4Session) readFrameDeadline(ctx context.Context, deadline time.Time) ([]byte, error) {
+	_ = s.conn.SetReadDeadline(deadline)
+
+	type readResult struct {
+		message []byte
+		err     error
 	}
-	return message, nil
+	done := make(chan readResult, 1)
+	go func() {
+		_, message, err := s.conn.ReadMessage()
+		done <- readResult{message: message, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		_ = s.conn.Close() // interrupt the blocked read
+		<-done             // unwind the reader goroutine so it does not leak
+		return nil, ctx.Err()
+	case r := <-done:
+		return r.message, r.err
+	}
 }
 
 func (s *Core4Session) writeJSON(ctx context.Context, value any) error {

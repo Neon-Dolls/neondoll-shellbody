@@ -306,3 +306,133 @@ func TestAdvertiseCapabilitiesValidatesBeforeSend(t *testing.T) {
 		t.Fatalf("zero-capability advertisement should validate: %v", err)
 	}
 }
+
+// wsIdleCore upgrades /ws, runs the Body Authentication v1 handshake, reads the
+// capability advertisement, then sends nothing further: it holds the connection
+// open but idle, returning only once the Body disconnects.
+type wsIdleCore struct {
+	t *testing.T
+}
+
+func (h *wsIdleCore) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		h.t.Errorf("upgrade: %v", err)
+		return
+	}
+	defer conn.Close()
+	if err := runServerHandshake(conn, h.t, bodyPubKey); err != nil {
+		h.t.Errorf("handshake: %v", err)
+		return
+	}
+	var adv core4.CapabilitiesAdvertisement
+	if err := readJSON(conn, &adv); err != nil {
+		h.t.Errorf("read advertisement: %v", err)
+		return
+	}
+	// Hold the connection idle until the Body hangs up.
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+	}
+}
+
+// mustDialAuthenticated establishes an authenticated, capability-advertised
+// session against a fake Core that then goes idle.
+func mustDialAuthenticated(t *testing.T, wsURL string) *Core4Session {
+	t.Helper()
+	creds := Credentials{
+		BodyID:        testBodyID,
+		PrivateKey:    bodyPrivKey,
+		CoreID:        testCoreID,
+		CorePublicKey: corePubKey,
+	}
+	sess, err := DialCore4(wsURL, creds, execution.New(process.NewExecutor(), 5*time.Second))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := sess.Authenticate(ctx); err != nil {
+		sess.Close()
+		t.Fatalf("authenticate: %v", err)
+	}
+	if err := sess.AdvertiseCapabilities(ctx, execution.Advertised()); err != nil {
+		sess.Close()
+		t.Fatalf("advertise: %v", err)
+	}
+	return sess
+}
+
+// TestRunIdleSessionStaysAlive guards the read-lifecycle fix: a healthy
+// authenticated session left idle must not be disconnected by a read deadline.
+// It arms a short read deadline on the session connection to emulate a
+// lingering/rolling read timer; readFrame must clear it so the idle session
+// survives past it.
+func TestRunIdleSessionStaysAlive(t *testing.T) {
+	srv := httptest.NewServer(&wsIdleCore{t: t})
+	defer srv.Close()
+	wsURL := "ws" + srv.URL[len("http"):] + "/ws"
+	sess := mustDialAuthenticated(t, wsURL)
+	defer sess.Close()
+
+	// Emulate a read timer that would kill an idle session.
+	_ = sess.conn.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- sess.Run(runCtx) }()
+
+	// Wait well past the armed deadline: the session must remain connected.
+	time.Sleep(500 * time.Millisecond)
+	select {
+	case err := <-runErr:
+		t.Fatalf("idle session was disconnected by a read deadline: %v", err)
+	default:
+	}
+
+	// Cleanup and double-check cancellation unwinds the run loop.
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != context.Canceled {
+			t.Fatalf("expected context.Canceled after cancel, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("run loop did not unwind after cancellation")
+	}
+}
+
+// TestRunCancellationInterruptsBlockedRead guards the read-lifecycle fix: a
+// session blocked on a deadline-less read must be interrupted promptly by
+// cancellation, returning context.Canceled rather than stalling indefinitely.
+func TestRunCancellationInterruptsBlockedRead(t *testing.T) {
+	srv := httptest.NewServer(&wsIdleCore{t: t})
+	defer srv.Close()
+	wsURL := "ws" + srv.URL[len("http"):] + "/ws"
+	sess := mustDialAuthenticated(t, wsURL)
+	defer sess.Close()
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	runErr := make(chan error, 1)
+	go func() { runErr <- sess.Run(runCtx) }()
+
+	// Let Run block on the (deadline-less) read.
+	time.Sleep(200 * time.Millisecond)
+
+	start := time.Now()
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != context.Canceled {
+			t.Fatalf("expected context.Canceled, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancellation did not interrupt the blocked read promptly")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("cancellation took %v to interrupt the blocked read", elapsed)
+	}
+}
