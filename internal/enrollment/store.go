@@ -19,6 +19,7 @@ var ErrStateNotFound = errors.New("enrollment: state not found")
 // mints the BodyID at completion; the Body stores what Core issued.
 type Record struct {
 	CoreID                   string            `json:"core_id"`
+	CorePublicKey            string            `json:"core_public_key,omitempty"` // Core's Ed25519 public key (base64url), trust anchor for auth
 	BodyID                   string            `json:"body_id"`
 	BodyPublicKeyFingerprint string            `json:"body_key_fingerprint"`
 	MembershipReference      string            `json:"membership_reference"`

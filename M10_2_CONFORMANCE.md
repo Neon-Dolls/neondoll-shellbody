@@ -1,9 +1,12 @@
 # M10.2 — Shell Body ⇄ Core 4 Conformance
 
-**Status:** complete — Shell Body now *adapts to* Core 4's canonical protocol; it no longer
-expects Core to speak a legacy vocabulary Core never implemented.
+**Status:** complete — Shell Body now *adapts to* Core 4's canonical protocol, including
+in-band Body Authentication v1 and owner-controlled enrollment. The previous "Core has no
+auth callback" blocker is **resolved** in current Core and the new wire contract is proven
+end-to-end here.
 
-**Branches:** Shell Body `m10-core4-conformance` ⇄ Core `main` (`c1132d3`, Core 4).
+**Branches:** Shell Body `m10-core4-conformance` ⇄ Core `main` (**`f55199f`, Core 4**, incl.
+PR #67 Body Auth v1, PR #68 Owner enrollment control, PR #69 Reference Body harness).
 **Architecture rule:** NeonDoll Core defines the protocol; Shell Body adapts to Core.
 
 ---
@@ -11,119 +14,128 @@ expects Core to speak a legacy vocabulary Core never implemented.
 ## 1. What changed vs. the M10.1 baseline
 
 M10.1 (Core `d24571c`) concluded Core had *no* Body protocol. **That is obsolete.** Core 4
-(`c1132d3`) added a complete, production-wired enrollment + execution surface. M10.2
-re-does the reconnaissance against the real Core 4 contract and lands conformance code.
+added a complete production-wired surface. M10.2 re-does the reconnaissance and lands
+conformance code, updated for the post-`c1132d3` advances.
 
 | Surface | M10.1 assumed | Core 4 actually has |
 |---|---|---|
-| Enrollment | none (legacy `/v1/pair` invitation pairing) | `POST /v1/body/enrollment/{begin,redeem,result}` — signed Ed25519 challenge/response |
+| Enrollment | none (legacy `/v1/pair` invitation pairing) | `POST /v1/body/enrollment/{begin,redeem,result}` — signed Ed25519 challenge/response; **owner-controlled** |
 | Identity | self-minted `body_<hex>`, no keypair | **Core mints `body_id`** after the Body proves possession of an Ed25519 key |
-| Handshake | `body.hello` → `core.hello` (blocks) | **none on the socket** — acceptance decided at `/ws` upgrade by `AuthenticateExecution` |
+| Session auth | `body.hello` → `core.hello` (blocks) | **Body Authentication v1:** in-band `body.auth.hello` → challenge → proof → accept over `/ws` |
 | Capability advertisement | custom `body.capabilities` (terminal in/out) | canonical `body.capabilities` (ID/operations/available/constraints/metadata) |
 | Execution | session.* `terminal_input/output` events | canonical `execution.request` / `execution.result` (8 statuses) |
 
-`body.hello`, `core.hello`, `body.ready`, `session.*`, `terminal_input`, `terminal_output`,
-`delegation.*` do **not** exist in Core 4. Shell Body no longer introduces them.
+`body.hello`, `core.hello`, `body.ready`, `session.*`, `terminal_input`, `terminal_output`
+do **not** exist in Core 4. Shell Body no longer introduces them.
 
 ## 2. Core 4 canonical contract (what Shell Body now conforms to)
 
-**Enrollment (HTTP, plain POST, no auth token — the signature IS the proof):**
+**Enrollment (HTTP, plain POST — the signature IS the proof):**
 1. Body generates an **Ed25519** keypair (`body_public_key`) + owns an **X25519** WireGuard key.
-2. `POST begin` (body_request mode) *or* `POST redeem` (invitation mode — canonical register path).
+2. `POST begin` (body_request mode) → Core returns a signed **pending challenge** carrying an
+   **owner approval code**; the **owner** approves it (`OwnerControl`, permissions-gated).
+   Or `POST redeem` (invitation mode) → Core returns a signed receipt directly.
 3. Every request is signed over the **`NEONDOLL-SIGN-V1\x00`** length-prefixed transcript
-   (`Core/DollNetwork/enrollment_signing.go`). Anti-replay via a per-flow `RequestID` + 32-byte
-   `nonce`, reused across redeem→result.
-4. `POST result` polls the terminal state/signed receipt. Core mints `body_id` (`body_<uuid>`),
-   a membership reference (WG peer), permissions, and signs the `EnrollmentReceipt`.
+   (`Core/DollNetwork/enrollment_signing.go`), anti-replay via per-flow `RequestID` + nonce.
+4. `POST result` returns the terminal signed **`EnrollmentReceipt`** when the status is
+   `enrolled`. Core mints `body_id`, a WG membership, and grants the approved permissions.
 
-**Base64 asymmetry (the subtle, load-bearing detail):** `body_public_key`, `body_nonce`, and
-`signature` are **RawURL** base64; **`wg_public_key` is STANDARD base64** (RFC 4648)
-(`Core/DollNetwork/pairing.go:34` `DecodeWgPublicKey` uses `base64.StdEncoding`). Shell Body
-reproduces this exactly.
+**Base64 asymmetry (load-bearing):** `body_public_key`, `body_nonce`, and `signature` are
+**RawURL** base64; **`wg_public_key` is STANDARD base64** (RFC 4648)
+(`Core/DollNetwork/pairing.go` `DecodeWgPublicKey` uses `base64.StdEncoding`). Also,
+`core_nonce` is a **raw** transcript field (decoded bytes), while the other pending fields are
+string fields — Shell Body reproduces both asymmetries exactly.
+
+**Body Authentication v1 (in-band, on `/ws`, Ed25519):**
+1. Body sends `body.auth.hello` `{body_id, body_nonce, algorithms:["Ed25519"]}`.
+2. Core replies `body.auth.challenge` — Core signs `(core_id, body_id, session_id,
+   body_nonce, core_nonce, expires_at, algorithm)` with its Ed25519 key.
+3. Body **verifies** the challenge with Core's public key (its trust anchor), then sends
+   `body.auth.proof` — Body signs `(core_id, body_id, session_id, body_nonce, core_nonce,
+   algorithm)` with its *enrolled* Ed25519 key.
+4. Core verifies the proof against the enrolled body key, replies `body.auth.accept`
+   `{status:"authenticated"}` signed by Core. The connection is then execution-capable.
+   (`Core/DollLink/Authentication`, wired in production via `SetBodyAuthenticator`.)
 
 **Execution session (`/ws`):**
-- A connection becomes an execution session only when `ws.Config.AuthenticateExecution`
-  returns a stable Body identity at upgrade time; otherwise it is Events/Actions-only and
-  "ineligible for execution" (`Core/DollLink/WebSocket/types.go:104-116`).
-- Authenticated Body then advertises **`body.capabilities`** (body_id must equal the
-  authenticated identity) and answers **`execution.request`** (Core→Body) with a correlated
-  **`execution.result`** (`correlation_id = request.id`, same execution_id/body_id).
-- Canonical statuses: `success | denied | unsupported | invalid | unavailable | failed |
-  cancelled | expired`.
+- An authenticated Body advertises **`body.capabilities`** and answers **`execution.request`**
+  (Core→Body) with a correlated **`execution.result`** (`correlation_id = request.id`, same
+  execution_id/body_id). Canonical statuses: `success | denied | unsupported | invalid |
+  unavailable | failed | cancelled | expired`.
 
-## 3. What Shell Body shipped in this PR (smallest useful conformance surface)
+## 3. What Shell Body ships in this PR (smallest useful conformance surface)
 
 All production code is an **independent reimplementation** — it does not import neondoll
-(keeping the standing rule that only the integration test may import Core).
+(only the integration test may).
 
 | Path | What it is |
 |---|---|
-| `internal/enrollment/` | Core-4-conformant enrollment client: `types.go` (canonical wire structs), `signing.go` (independent `NEONDOLL-SIGN-V1` transcript + verify, wg std-base64), `keypair.go` (Ed25519 identity), `store.go` (persist identity + Core-issued record), `client.go` (begin/redeem/result HTTP client). |
-| `internal/link/core4/` | Canonical Doll Link wire types + validation mirroring Core 4 (`body.capabilities`, `execution.request/result`, envelope/timestamp/correlation rules). |
-| `internal/execution/core4.go` | Adapter: canonical `execution.request{capability,operation,arguments}` → host-process executor → canonical `execution.result`, with Core status mapping (unsupported/invalid/failed/cancelled/expired/success). Advertises a Body-local `process`/`run` capability contract. |
-| `internal/body/core4session.go` | Conformant `/ws` session: dial, advertise capabilities, serve `execution.request`→`execution.result`; resilient to unknown inbound types (like Core's own readLoop). No hello/session vocabulary. |
-| `cmd/neondoll-shellbody` | New `--enroll <invite.json> --core-url <base> --core-id <id>` (signed enrollment → persisted body_id + membership) and `--serve <ws://.../ws>` (run the execution session). |
-| `test/m10_2_core4_conformance_test.go` | The one sanctioned Core-importing test: proves Shell Body enrolls through a **real Core 4 service over HTTP**, the receipt verifies under **Core's own public key**, the WG membership is active, and capabilities + execution result pass **Core's canonical validators**. |
-
-legacy `internal/body/dollink_client.go` (body.hello/core.hello/session.* etc.) and the M2
-pairing client are now **superseded library code**: they are not wired into the production
-path and must not be used to build a Core 4 connection. (Left in place to avoid breaking the
-legacy test suite; flagged in code comments.)
+| `internal/enrollment/` | Core-4-conformant enrollment client: `types.go` (canonical wire structs incl. pending `approval_code`), `signing.go` (independent `NEONDOLL-SIGN-V1` transcript incl. **raw `core_nonce`** field), `keypair.go`, `store.go` (persists `core_public_key` trust anchor), `client.go` (begin → owner approve → result, or redeem). |
+| `internal/auth/` | Independent **Body Authentication v1** package: `body.auth.hello/challenge/proof/accept` wire types + transcript sign/verify (mirrors `DollLink/Authentication`), reusing the exported transcript primitives like Core reuses `DollNetwork`. |
+| `internal/link/core4/` | Canonical Doll Link wire types + validation mirroring Core 4. |
+| `internal/execution/core4.go` | Adapter: canonical `execution.request{capability,operation,arguments}` → host-process executor → canonical `execution.result`. Advertises `process`/`run`. |
+| `internal/body/core4session.go` | Conformant `/ws` session that **authenticates (Body Auth v1)**, advertises capabilities, and serves `execution.request`→`execution.result`. |
+| `cmd/neondoll-shellbody` | `--enroll --core-url --core-id --core-key` (signed enrollment, persists Core trust anchor) and `--serve <ws://…/ws>` (authenticate with the enrolled identity, advertise, run). |
+| `test/m10_2_core4_conformance_test.go` | The one sanctioned Core-importing test: **real Core 4 over HTTP + WebSocket** — owner-controlled enrollment (begin→approve→result), **real Body Auth v1 handshake**, capability advertisement landing in Core's registry, one **authorized `process` execution** reported by Core's own guard, plus negative denials; capabilities/execution byte-parity against Core's canonical validators. |
 
 ## 4. Compatibility matrix
 
 | "Can it talk to Core 4 today?" | Legacy client | Core4 client (this PR) |
 |---|---|---|
-| Enrollment (signed) | ✗ (legacy `/v1/pair`, not wired, non-canonical) | ✅ real Core accepted it |
-| Capability advertisement | ✗ (wrong shape, body.hello gated) | ✅ passes Core `capabilities.Validate` |
-| Execution result | ✗ (statuses `timeout` etc. non-canonical) | ✅ passes Core `Result.Validate(SenderBody)` + `ValidateResponseTo` |
+| Enrollment (signed) | ✗ (legacy `/v1/pair`, not wired) | ✅ real Core accepted begin + owner approval + result (verify under Core's key) |
+| Session authentication | ✗ (body.hello, non-canonical) | ✅ **Body Auth v1 handshake accepted by real Core** (verified accept under Core's key) |
+| Capability advertisement | ✗ (wrong shape) | ✅ lands in real Core's RemoteBody registry |
+| Authorized execution | ✗ | ✅ **real process runs, result round-trips through Core's guard as `success`**; unauthorized ops denied |
 | Requires Core to implement hello/session | yes | **no** |
-| Production-implemented | no (never wired) | `--enroll` + `--serve` |
 
-## 5. Genuine Core blocker (exact source + behavior needed)
+## 5. Blockers: RESOLVED + remaining gaps
 
-Shell Body now *conforms* to Core 4's contract. The remaining gap is **Core-side**, not a
-Shell Body adapter gap:
+**Resolved (Core side, since the M10.2 draft):** the reported `AuthenticateExecution` gap is
+obsolete. Current Core wires `wsServer.SetBodyAuthenticator(enrollmentService)` in
+`cmd/neondolld/main.go` and supplies an in-band Ed25519 handshake
+(`Core/DollLink/Authentication`); owner control (`Core/OwnerControl`, admin socket approval)
+replaces the deny-by-default authorizer and provides real, permission-gated authorization.
+Shell Body now reproduces and proves that full contract.
 
-- **`cmd/neondolld/main.go` never sets `ws.Config.AuthenticateExecution`.**
-  Line 159 constructs `wsCfg := ws.Config{Listen: listenAddr}` with no authenticator, so
-  `Core/DollLink/WebSocket/types.go:129-131` leaves `s.authenticateExecution = nil`. Per
-  `types.go:104-116` a nil/failing authenticator leaves the connection "ineligible for
-  execution". Consequence: in a production daemon, **no Body can ever obtain an execution
-  session**, `RemoteRegistrar.SessionConnected`/`CapabilitiesAdvertised` never fire
-  (`Core/Body/remote_registration.go` is dead in production), and every
-  `execution.request`/`body.capabilities` a Body sends is dropped with a warning.
-
-- **Enrollment endpoint authorization is denied-by-default.**
-  `cmd/neondolld/main.go:172` passes `nil` owners to `enrollment.NewService`, which defaults
-  to `denyOwnerAuthorizer` (`Core/Enrollment/service.go:38-43`). The invitation *redeem*
-  path works (it does not consult the owner authorizer), but the begin + owner-approve path
-  is dead without a real owner/authorizer. Invitation-mode redeem is therefore the only
-  production-enrollable path today.
-
-- **No production mechanism maps an enrolled Body's credentials to the `/ws` auth boundary.**
-  Even after successful enrollment a Body holds a `body_id` + membership, but the daemon
-  provides no `AuthenticateExecution` that verifies those credentials against a request.
-
-**Behavior needed (Core):** wire a production `AuthenticateExecution` into `ws.Config` that
-authenticates an enrolled Body (e.g. from an enrollment-issued token/session, or by verifying
-the membership) and returns its `body_id`; supply a real owner authorize path (or keep
-invitation redeem as the sole supported register path and document it); optionally add a
-`/v1/body/enrollment/result`-style admin query. Until then, Shell Body's conformant
-`--enroll` work to completion and `--serve` connects, but execution-capable sessions in a
-production `neondolld` require Core's auth callback.
+**Remaining gaps (honest):**
+1. **No Core identity bootstrap over the wire.** Core does not expose its Ed25519 public key
+   over HTTP or discovery (the reference harness passes it in-process). A remote Body must
+   be configured with Core's public key as a **pre-shared trust anchor** to verify the
+   pending/enrollment/auth signatures. Shell Body therefore requires `--core-key`; a
+   `/v1/core/identity` discovery endpoint is Core-side future work.
+2. **CLI enroll path vs. owner-control path.** The CLI `--enroll` uses the canonical
+   invitation-`redeem` register path (owner consents by creating the invitation). The
+   **owner-control** `begin → owner approve (permissions) → result` path is proven in the
+   integration test against a real Core + real owner admin socket; wiring it into the CLI's
+   interactive flow is follow-up.
+3. **Production execution trigger is Core-side.** Execution dispatch is driven through Core's
+   `Guard`/`Registry` (as the reference harness `/reference/execute` does); `neondolld` does
+   not yet expose an owner-facing execution endpoint for remote bodies. That is Core work,
+   orthogonal to Shell Body conformance (which is proven here).
 
 ## 6. Tests
 
-- `internal/enrollment`: signed-enrollment round-trips, transcript known-vector, wg std-base64,
-  client against a Core-mirroring httptest stub.
+- `internal/enrollment`: signed-enrollment round-trips, transcript known-vector, wg
+  std-base64, **raw `core_nonce` pending field**, client against a Core-mirroring stub.
+- `internal/auth`: Body Auth v1 transcript round-trip, tamper rejection, status/binding
+  checks, rogue-trust-anchor rejection.
 - `internal/link/core4`: capabilities/request/result validation + correlation rules.
-- `internal/execution`: adapter — success, unsupported capability, invalid args, missing
-  binary → failed, cancelled context.
-- `internal/body`: full `/ws` loopback round-trip (advertise → request → correlated result).
-- `test/m10_2_core4_conformance_test.go`: **real Core 4** enrollment over HTTP (redeem
-  accepted, receipt verified by Core's own key, active membership), and capabilities +
-  execution conformance against Core's canonical validators.
+- `internal/execution`: adapter — success, unsupported capability, invalid args, failed,
+  cancelled context.
+- `internal/body`: full `/ws` **authenticated** round-trip against an independent fake Core
+  (hello→challenge→proof→accept→advertise→request→correlated result), rogue trust anchor.
+- `test/m10_2_core4_conformance_test.go`: **real Core 4** — owner-controlled enrollment;
+  **real Body Auth v1**; advertised capability lands in the registry; one **authorized
+  `process` execution** (real spawned process, output round-trips through Core's guard) plus
+  unauthorized/unknown-body denials; capabilities + execution byte-parity with Core's
+  canonical validators.
 
 **Verification:** `gofmt` clean, `go vet ./...` clean, `go test -race ./... -count=1` — all
-13 packages pass.
+14 packages (incl. integration) pass. **Core commit tested: `f55199f`** (post-`c1132d3`,
+incl. PR #67/#68/#69). Distinguishing proof types: the **real end-to-end** tests are
+`TestShellBodyAuthenticationAndProcessExecutionAgainstCore` (owner-controlled enrollment +
+Body Auth v1 + capability advertisement + authorized process execution round-trip over a
+real Core WebSocket) and `TestShellBodyEnrollmentConformsToCore4` (owner-control
+begin→approve→result); the **byte-parity/validator** tests are
+`TestShellBodyCapabilitiesConformToCore4` and `TestShellBodyExecutionConformsToCore4`
+(compare against Core's canonical `capabilities.Validate` / `execution.Result.Validate`).

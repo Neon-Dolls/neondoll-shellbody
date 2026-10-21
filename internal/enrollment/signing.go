@@ -18,7 +18,6 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
-	"time"
 )
 
 // signingDomain is the canonical domain-separator prefix.
@@ -314,6 +313,32 @@ func verify(publicKey ed25519.PublicKey, messageType, encodedSignature string, f
 	return nil
 }
 
+// SignedField is one length-prefixed byte field in a transcript.
+type SignedField = signedField
+
+// StringField wraps a string as a canonical transcript field.
+func StringField(value string) (SignedField, error) { return stringField(value) }
+
+// RawField wraps arbitrary bytes (public keys, nonces) as a canonical
+// transcript field.
+func RawField(value []byte) SignedField { return rawField(value) }
+
+// DecodeNonce decodes the canonical base64url nonce representation and
+// validates it is exactly 32 bytes, as required for body_nonce/core_nonce.
+func DecodeNonce(encoded string) ([]byte, error) { return decodeNonce(encoded) }
+
+// DecodeSignature decodes a canonical base64url Ed25519 signature. Provided
+// for parity with DollNetwork's verify path.
+func DecodeSignature(encoded string) ([]byte, error) { return DecodeRawURL(encoded) }
+
+// SignedMessage builds the canonical length-prefixed transcript for a message
+// type + fields, mirroring DollNetwork.SignedMessage. This is the shared
+// transcript engine reused by the enrollment and body authentication
+// protocols (independent production reimplementation).
+func SignedMessage(messageType string, fields ...SignedField) []byte {
+	return signedMessage(messageType, fields)
+}
+
 // SignEnrollmentPending signs the Core challenge. Provided for symmetric
 // parity and test use; a Body client does not sign Core responses.
 func SignEnrollmentPending(privateKey ed25519.PrivateKey, response *EnrollmentPendingResponse) error {
@@ -325,23 +350,31 @@ func SignEnrollmentPending(privateKey ed25519.PrivateKey, response *EnrollmentPe
 }
 
 func pendingFields(response *EnrollmentPendingResponse) ([]signedField, error) {
-	values := []string{
-		response.CoreID,
-		response.RequestID,
-		response.BodyKeyFingerprint,
-		response.CoreNonce,
-		response.ApprovalCode,
-		response.ExpiresAt.UTC().Truncate(time.Second).Format(timeLayout),
+	// Mirror Core's DollNetwork.SignEnrollmentPending transcript byte-for-byte:
+	// core_nonce is a RAW field (decoded bytes), all others are string fields,
+	// expires_at is formatted without truncation.
+	coreNonce, err := decodeNonce(response.CoreNonce)
+	if err != nil {
+		return nil, fmt.Errorf("enrollment: invalid core_nonce: %w", err)
 	}
-	fields := make([]signedField, 0, len(values))
-	for _, v := range values {
-		f, err := stringField(v)
-		if err != nil {
-			return nil, err
-		}
-		fields = append(fields, f)
+	var f0, f1, f2, f4 signedField
+	if f0, err = stringField(response.CoreID); err != nil {
+		return nil, err
 	}
-	return fields, nil
+	if f1, err = stringField(response.RequestID); err != nil {
+		return nil, err
+	}
+	if f2, err = stringField(response.BodyKeyFingerprint); err != nil {
+		return nil, err
+	}
+	if f4, err = stringField(response.ApprovalCode); err != nil {
+		return nil, err
+	}
+	f5, err := stringField(response.ExpiresAt.UTC().Format(timeLayout))
+	if err != nil {
+		return nil, err
+	}
+	return []signedField{f0, f1, f2, rawField(coreNonce), f4, f5}, nil
 }
 
 // VerifyEnrollmentPending verifies a Core-signed challenge using Core's
@@ -381,7 +414,7 @@ func receiptFields(receipt *EnrollmentReceipt) ([]signedField, error) {
 		receipt.BodyID,
 		receipt.BodyPublicKeyFingerprint,
 		receipt.MembershipReference,
-		receipt.IssuedAt.UTC().Truncate(time.Second).Format(timeLayout),
+		receipt.IssuedAt.UTC().Format(timeLayout),
 	}
 	fields := make([]signedField, 0, len(values))
 	for _, v := range values {

@@ -10,6 +10,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"flag"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Neon-Dolls/neondoll-shellbody/internal/auth"
 	"github.com/Neon-Dolls/neondoll-shellbody/internal/body"
 	"github.com/Neon-Dolls/neondoll-shellbody/internal/dollnetwork"
 	"github.com/Neon-Dolls/neondoll-shellbody/internal/enrollment"
@@ -67,6 +69,7 @@ func run(args []string) error {
 
 	coreURL := fs.String("core-url", "", "Core base HTTP URL for enrollment (e.g. http://host:port)")
 	coreID := fs.String("core-id", "", "Core identity (core_id) that is being enrolled with")
+	coreKey := fs.String("core-key", "", "Core's Ed25519 public key (base64url), the trust anchor for Body Authentication v1")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -93,7 +96,7 @@ func run(args []string) error {
 	case *pairMode != "":
 		return pair(store, *pairMode)
 	case *enrollMode != "":
-		return enroll(store, *enrollMode, *coreURL, *coreID)
+		return enroll(store, *enrollMode, *coreURL, *coreID, *coreKey)
 	case *serveMode != "":
 		return serve(store, *serveMode)
 	case *connectMode:
@@ -297,10 +300,21 @@ func pair(store *body.Store, invitationFile string) error {
 // enroll consumes a Core 4 invitation and runs the canonical signed enrollment
 // redemption flow (Core 4 Body enrollment v1). On success it persists the
 // Core-minted body_id, permissions and membership reference, then exits 0.
-func enroll(store *body.Store, invitationFile, coreURL, coreID string) error {
+func enroll(store *body.Store, invitationFile, coreURL, coreID, coreKeyRaw string) error {
 	if coreURL == "" || coreID == "" {
 		return errors.New("--enroll requires --core-url and --core-id")
 	}
+	if coreKeyRaw == "" {
+		return errors.New("--enroll requires --core-key (Core's Ed25519 public key, base64url)")
+	}
+	corePubRaw, err := enrollment.DecodeRawURL(coreKeyRaw)
+	if err != nil {
+		return fmt.Errorf("invalid --core-key encoding: %w", err)
+	}
+	if len(corePubRaw) != ed25519.PublicKeySize {
+		return errors.New("--core-key must decode to a 32-byte Ed25519 public key")
+	}
+	corePub := ed25519.PublicKey(corePubRaw)
 
 	raw, err := os.ReadFile(invitationFile)
 	if err != nil {
@@ -349,9 +363,13 @@ func enroll(store *body.Store, invitationFile, coreURL, coreID string) error {
 	if err != nil {
 		return fmt.Errorf("enrollment failed: %w", err)
 	}
+	if err := enrollment.VerifyEnrollmentReceipt(corePub, *receipt); err != nil {
+		return fmt.Errorf("enrollment: Core receipt failed trust-anchor verification: %w", err)
+	}
 
 	record := &enrollment.Record{
 		CoreID:                   receipt.CoreID,
+		CorePublicKey:            coreKeyRaw,
 		BodyID:                   receipt.BodyID,
 		BodyPublicKeyFingerprint: receipt.BodyPublicKeyFingerprint,
 		MembershipReference:      receipt.MembershipReference,
@@ -389,17 +407,43 @@ func serve(store *body.Store, wsURL string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if record.CorePublicKey == "" {
+		return errors.New("record has no core_public_key trust anchor; re-run --enroll with --core-key")
+	}
+	corePubRaw, err := enrollment.DecodeRawURL(record.CorePublicKey)
+	if err != nil {
+		return fmt.Errorf("record core_public_key is invalid: %w", err)
+	}
+	enrIdent, err := enrStore.LoadIdentity()
+	if err != nil {
+		return fmt.Errorf("load identity for authentication: %w", err)
+	}
+
 	adapter := execution.New(process.NewExecutor(), 30*time.Second)
-	sess, err := body.DialCore4(wsURL, record.BodyID, adapter)
+	creds := body.Credentials{
+		BodyID:        record.BodyID,
+		PrivateKey:    enrIdent.PrivateKey(),
+		CoreID:        record.CoreID,
+		CorePublicKey: ed25519.PublicKey(corePubRaw),
+	}
+	sess, err := body.DialCore4(wsURL, creds, adapter)
 	if err != nil {
 		return err
 	}
 	defer sess.Close()
 
+	accept, err := sess.Authenticate(ctx)
+	if err != nil {
+		return fmt.Errorf("Body Authentication v1 failed: %w", err)
+	}
+	if accept.Status != auth.StatusAuthenticated {
+		return fmt.Errorf("authentication not accepted by Core (status=%q)", accept.Status)
+	}
+
 	if err := sess.AdvertiseCapabilities(ctx, execution.Advertised()); err != nil {
 		return fmt.Errorf("failed to advertise capabilities: %w", err)
 	}
-	fmt.Printf("connected to Core 4 as body_id=%s\n", record.BodyID)
+	fmt.Printf("authenticated with Core as body_id=%s (session=%s)\n", record.BodyID, accept.SessionID)
 	fmt.Printf("advertised capability: %s (operations: %v)\n",
 		execution.CapabilityProcess, execution.Advertised()[0].Operations)
 	return sess.Run(ctx)
