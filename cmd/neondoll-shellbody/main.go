@@ -359,7 +359,15 @@ func enroll(store *body.Store, invitationFile, coreURL, coreID, coreKeyRaw strin
 	// bound below by receipt signature verification inside the owner-approved
 	// redemption ceremony.
 	var existing *enrollment.Record
-	if loaded, lerr := enrStore.LoadRecord(); lerr == nil {
+	loaded, lerr := enrStore.LoadRecord()
+	if lerr != nil {
+		// Only ErrStateNotFound means "no existing enrollment" (fresh state).
+		// Any other error — corrupt or unreadable state file — fails closed so
+		// we never silently discard an unverifiable trust anchor and re-enroll.
+		if !errors.Is(lerr, enrollment.ErrStateNotFound) {
+			return fmt.Errorf("enrollment: failed to read existing enrollment state: %w", lerr)
+		}
+	} else {
 		existing = loaded
 	}
 	res, err := enrollment.ResolveCoreTrust(ctx, hc, coreURL, coreID, coreKeyRaw, existing)
