@@ -17,6 +17,13 @@ const (
 	// EnrollmentVersion is the canonical enrollment protocol version (1).
 	EnrollmentVersion = 1
 
+	// CoreIdentityVersion is the canonical public identity document version.
+	CoreIdentityVersion = 1
+
+	// CoreIdentityAlgorithm is the only accepted signature algorithm for the
+	// Core signing identity served at GET /v1/core/identity.
+	CoreIdentityAlgorithm = "Ed25519"
+
 	// ModeInvitation and ModeBodyRequest are the two canonical enrollment
 	// modes. Redeem with an invitation is the canonical register path.
 	ModeInvitation  = "invitation"
@@ -116,4 +123,16 @@ type EnrollmentError struct {
 type EnrollmentErrorResponse struct {
 	Version int             `json:"version"`
 	Error   EnrollmentError `json:"error"`
+}
+
+// CoreIdentityResponse mirrors Core's public, read-only bootstrap identity
+// document served at GET /v1/core/identity (DollNetwork/core_identity.go in
+// the neondoll repository). It is discovery material for the enrollment
+// ceremony — never proof that a caller is an enrolled Body. The public_key is
+// the unpadded-base64url encoding of Core's 32-byte Ed25519 public key.
+type CoreIdentityResponse struct {
+	Version   int    `json:"version"`
+	CoreID    string `json:"core_id"`
+	Algorithm string `json:"algorithm"`
+	PublicKey string `json:"public_key"`
 }

@@ -3,7 +3,7 @@ module github.com/Neon-Dolls/neondoll-shellbody
 go 1.25.0
 
 require (
-	github.com/Neon-Dolls/neondoll v0.0.0-20261021193337-f55199ff9b42
+	github.com/Neon-Dolls/neondoll v0.0.0-20261021225008-07ee0975412b
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
 	golang.org/x/crypto v0.37.0

@@ -125,10 +125,13 @@ Distinguishing proof types: the **real end-to-end** recovery proofs are
 
 ## 5. Remaining production deployment limitations (honest)
 
-1. **Core identity trust anchor is still out-of-band.** As in M10.2, Core does not publish its
-   Ed25519 key over the wire; `--serve`/`--enroll` still require Core's public key as a
-   pre-shared `--core-key`. A `/v1/core/identity` discovery endpoint is Core-side future work
-   that would make remote on-boarding self-bootstrapping.
+1. **~~Core identity trust anchor is still out-of-band~~ — RESOLVED in M10.4.** Shell Body's
+   `--enroll` now discovers Core's Ed25519 identity from `GET /v1/core/identity` (Core PR #71),
+   validates it, and binds it to the owner-approved ceremony by receipt signature verification
+   before persisting it as the trust anchor. `--core-key`/`--core-id` remain only as the
+   explicit/offline path and are cross-checked against a reachable Core; an existing pinned
+   anchor is never silently replaced. `--serve` continues to authenticate against the persisted
+   anchor.
 2. **Fail-closed is a body operator decision, not a Core one.** Shell Body treats any
    post-dial handshake rejection as permanent. That is the safe choice (no infinite retry on a
    revoked identity), but a transient Core-side handshake hiccup on a *validly enrolled* Body

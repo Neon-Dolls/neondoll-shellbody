@@ -56,7 +56,7 @@ func run(args []string) error {
 	initMode := fs.Bool("init", false, "initialize a fresh state directory with a new Body identity and exit")
 	pairMode := fs.String("pair", "", "pair with a Core by consuming an invitation JSON file, then exit")
 	connectMode := fs.Bool("connect", false, "establish a WireGuard tunnel to the paired Core using persisted state")
-	enrollMode := fs.String("enroll", "", "enroll as a Body with a Core 4 instance by consuming an invitation JSON file (requires --core-url and --core-id)")
+	enrollMode := fs.String("enroll", "", "enroll as a Body with a Core 4 instance by consuming an invitation JSON file (requires --core-url; Core identity is discovered via GET /v1/core/identity unless --core-id/--core-key are supplied)")
 	serveMode := fs.String("serve", "", "run a Core 4 Doll Link execution session against a Core ws URL (e.g. ws://host:port/ws)")
 
 	// Options.
@@ -68,8 +68,8 @@ func run(args []string) error {
 	build := fs.String("build", version, "build/version stamp")
 
 	coreURL := fs.String("core-url", "", "Core base HTTP URL for enrollment (e.g. http://host:port)")
-	coreID := fs.String("core-id", "", "Core identity (core_id) that is being enrolled with")
-	coreKey := fs.String("core-key", "", "Core's Ed25519 public key (base64url), the trust anchor for Body Authentication v1")
+	coreID := fs.String("core-id", "", "expected Core identity (core_id); cross-checked against discovery when both are present, required only for the offline --core-key path")
+	coreKey := fs.String("core-key", "", "Core's Ed25519 public key (base64url), an explicit trust anchor for Body Authentication v1 (optional; when omitted, discovery is used)")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -298,23 +298,16 @@ func pair(store *body.Store, invitationFile string) error {
 }
 
 // enroll consumes a Core 4 invitation and runs the canonical signed enrollment
-// redemption flow (Core 4 Body enrollment v1). On success it persists the
-// Core-minted body_id, permissions and membership reference, then exits 0.
+// redemption flow (Core 4 Body enrollment v1). By default it resolves Core's
+// trust anchor by identity discovery (GET /v1/core/identity); the operator may
+// instead supply an explicit --core-key/--core-id trust anchor. Discovered or
+// explicit, the anchor is bound to the owner-approved redemption by receipt
+// signature verification (plus a Core ID cross-check) and then persisted. It
+// never silently replaces an existing trust anchor.
 func enroll(store *body.Store, invitationFile, coreURL, coreID, coreKeyRaw string) error {
-	if coreURL == "" || coreID == "" {
-		return errors.New("--enroll requires --core-url and --core-id")
+	if coreURL == "" {
+		return errors.New("--enroll requires --core-url")
 	}
-	if coreKeyRaw == "" {
-		return errors.New("--enroll requires --core-key (Core's Ed25519 public key, base64url)")
-	}
-	corePubRaw, err := enrollment.DecodeRawURL(coreKeyRaw)
-	if err != nil {
-		return fmt.Errorf("invalid --core-key encoding: %w", err)
-	}
-	if len(corePubRaw) != ed25519.PublicKeySize {
-		return errors.New("--core-key must decode to a 32-byte Ed25519 public key")
-	}
-	corePub := ed25519.PublicKey(corePubRaw)
 
 	raw, err := os.ReadFile(invitationFile)
 	if err != nil {
@@ -358,18 +351,50 @@ func enroll(store *body.Store, invitationFile, coreURL, coreID, coreKeyRaw strin
 	defer stop()
 
 	hc := &http.Client{Timeout: 30 * time.Second}
-	client := enrollment.NewClient(coreURL, coreID, enrIdent, wgStd, hc)
+
+	// Resolve Core's trust anchor. Discovery is the default bootstrap path and
+	// any operator-supplied --core-key / --core-id is cross-checked against the
+	// live document; the policy also refuses to silently replace an existing
+	// pinned anchor. Discovery alone never establishes trust — the anchor is
+	// bound below by receipt signature verification inside the owner-approved
+	// redemption ceremony.
+	var existing *enrollment.Record
+	loaded, lerr := enrStore.LoadRecord()
+	if lerr != nil {
+		// Only ErrStateNotFound means "no existing enrollment" (fresh state).
+		// Any other error — corrupt or unreadable state file — fails closed so
+		// we never silently discard an unverifiable trust anchor and re-enroll.
+		if !errors.Is(lerr, enrollment.ErrStateNotFound) {
+			return fmt.Errorf("enrollment: failed to read existing enrollment state: %w", lerr)
+		}
+	} else {
+		existing = loaded
+	}
+	res, err := enrollment.ResolveCoreTrust(ctx, hc, coreURL, coreID, coreKeyRaw, existing)
+	if err != nil {
+		return err
+	}
+	corePub := ed25519.PublicKey(res.PublicKey)
+
+	client := enrollment.NewClient(coreURL, res.CoreID, enrIdent, wgStd, hc)
 	receipt, err := client.Redeem(ctx, inv.InvitationID, inv.InvitationSecret)
 	if err != nil {
 		return fmt.Errorf("enrollment failed: %w", err)
 	}
+
+	// Bind the resolved identity to the enrollment: the receipt must verify
+	// under the resolved public key AND name the same Core ID. Either failing
+	// means an identity mismatch or an invalid signature, both rejected.
 	if err := enrollment.VerifyEnrollmentReceipt(corePub, *receipt); err != nil {
 		return fmt.Errorf("enrollment: Core receipt failed trust-anchor verification: %w", err)
+	}
+	if receipt.CoreID != res.CoreID {
+		return fmt.Errorf("enrollment: Core identity mismatch: resolved %s, receipt %s", res.CoreID, receipt.CoreID)
 	}
 
 	record := &enrollment.Record{
 		CoreID:                   receipt.CoreID,
-		CorePublicKey:            coreKeyRaw,
+		CorePublicKey:            enrollment.EncodeRawURL(res.PublicKey),
 		BodyID:                   receipt.BodyID,
 		BodyPublicKeyFingerprint: receipt.BodyPublicKeyFingerprint,
 		MembershipReference:      receipt.MembershipReference,
@@ -407,8 +432,11 @@ func serve(store *body.Store, wsURL string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if record.CoreID == "" {
+		return errors.New("record has no core_id; re-run --enroll")
+	}
 	if record.CorePublicKey == "" {
-		return errors.New("record has no core_public_key trust anchor; re-run --enroll with --core-key")
+		return errors.New("record has no core_public_key trust anchor; re-run --enroll")
 	}
 	corePubRaw, err := enrollment.DecodeRawURL(record.CorePublicKey)
 	if err != nil {

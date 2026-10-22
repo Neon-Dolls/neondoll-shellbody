@@ -75,7 +75,7 @@ All production code is an **independent reimplementation** — it does not impor
 | `internal/link/core4/` | Canonical Doll Link wire types + validation mirroring Core 4. |
 | `internal/execution/core4.go` | Adapter: canonical `execution.request{capability,operation,arguments}` → host-process executor → canonical `execution.result`. Advertises `process`/`run`. |
 | `internal/body/core4session.go` | Conformant `/ws` session that **authenticates (Body Auth v1)**, advertises capabilities, and serves `execution.request`→`execution.result`. |
-| `cmd/neondoll-shellbody` | `--enroll --core-url --core-id --core-key` (signed enrollment, persists Core trust anchor) and `--serve <ws://…/ws>` (authenticate with the enrolled identity, advertise, run). |
+| `cmd/neondoll-shellbody` | `--enroll --core-url` (signed enrollment; Core identity resolved via `GET /v1/core/identity` discovery, optional `--core-id`/`--core-key` cross-checked/offline-anchor, persists Core trust anchor) and `--serve <ws://…/ws>` (authenticate with the enrolled identity, advertise, run). |
 | `test/m10_2_core4_conformance_test.go` | The one sanctioned Core-importing test: **real Core 4 over HTTP + WebSocket** — owner-controlled enrollment (begin→approve→result), **real Body Auth v1 handshake**, capability advertisement landing in Core's registry, one **authorized `process` execution** reported by Core's own guard, plus negative denials; capabilities/execution byte-parity against Core's canonical validators. |
 
 ## 4. Compatibility matrix
@@ -98,11 +98,13 @@ replaces the deny-by-default authorizer and provides real, permission-gated auth
 Shell Body now reproduces and proves that full contract.
 
 **Remaining gaps (honest):**
-1. **No Core identity bootstrap over the wire.** Core does not expose its Ed25519 public key
-   over HTTP or discovery (the reference harness passes it in-process). A remote Body must
-   be configured with Core's public key as a **pre-shared trust anchor** to verify the
-   pending/enrollment/auth signatures. Shell Body therefore requires `--core-key`; a
-   `/v1/core/identity` discovery endpoint is Core-side future work.
+1. **~~No Core identity bootstrap over the wire~~ — RESOLVED in M10.4.** Core now serves its
+   Ed25519 public identity at `GET /v1/core/identity` (Core PR #71). Shell Body's `--enroll`
+   discovers and validates this document and binds it to the owner-approved ceremony by
+   receipt signature verification, so `--core-key` is no longer required for a reachable
+   Core. `--core-key`/`--core-id` remain as the explicit/offline trust-anchor path and are
+   cross-checked against the discovered identity; an existing pinned anchor is never silently
+   replaced. Discovery alone never establishes trust.
 2. **CLI enroll path vs. owner-control path.** The CLI `--enroll` uses the canonical
    invitation-`redeem` register path (owner consents by creating the invitation). The
    **owner-control** `begin → owner approve (permissions) → result` path is proven in the
