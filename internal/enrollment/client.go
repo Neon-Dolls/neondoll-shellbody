@@ -19,9 +19,10 @@ const (
 	defaultHTTPTimeout = 30 * time.Second
 )
 
-// Client performs Core 4 enrollment HTTP requests. One (requestID, nonce)
-// pair is generated per attempt and MUST be reused across a flow (Core keys
-// result polls and anti-replay checks on them).
+// Client performs Core 4 enrollment HTTP requests. A (requestID) is pinned
+// per attempt and reused across a flow (Core keys result polls and anti-replay
+// checks on the requestID); each HTTP request carries a FRESH body nonce,
+// because Core consumes and anti-replays result nonces individually.
 type Client struct {
 	HTTP           *http.Client
 	BaseURL        string
@@ -100,10 +101,12 @@ func (c *Client) Redeem(ctx context.Context, invitationID, invitationSecret stri
 	return &receipt, nil
 }
 
-// Result polls the terminal enrollment status using the same requestID + nonce
-// established by Begin or Redeem. When Status == enrolled it carries the
-// receipt.
+// Result polls the terminal enrollment status using the pinned requestID from
+// Begin or Redeem, with a FRESH nonce for this poll (Core consumes each result
+// nonce; reusing a previous one is rejected as replayed). When Status ==
+// enrolled it carries the receipt.
 func (c *Client) Result(ctx context.Context) (*EnrollmentResultResponse, error) {
+	c.refreshNonce()
 	req := EnrollmentResultRequest{
 		Version:       EnrollmentVersion,
 		RequestID:     c.currentRequestID(),
@@ -126,6 +129,14 @@ func (c *Client) newAttempt() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.requestID = randomID("erq")
+	c.nonceRaw = EncodeRawURL(randomBytes(nonceSize))
+}
+
+// refreshNonce mints a fresh nonce while keeping the pinned requestID. Result
+// polling calls this so every poll presents a never-before-seen nonce.
+func (c *Client) refreshNonce() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.nonceRaw = EncodeRawURL(randomBytes(nonceSize))
 }
 

@@ -381,3 +381,67 @@ func TestBuildPairRequest_OmitsPrivateKey(t *testing.T) {
 		t.Fatal("pair request wire contains a private-key field")
 	}
 }
+
+// ── Core 4 enrollment invitation loading ─────────────────────────────────
+// `neondollctl body invite` emits an enrollment invitation with NO `version`
+// field and (absent -endpoint) no bootstrap endpoint. LoadEnrollmentInvitation
+// must accept it — Core 4 enrollment is version 1 by endpoint contract — while
+// still failing closed on malformed content. The legacy LoadInvitation path is
+// deliberately untouched.
+func TestLoadEnrollmentInvitation_AcceptsCoreInvitation(t *testing.T) {
+	exp := time.Now().UTC().Format(time.RFC3339)
+	raw := "{\"invitation_id\":\"id_1\",\"invitation_secret\":\"secret_1\",\"expires_at\":\"" + exp + "\"}"
+	inv, err := LoadEnrollmentInvitation(raw)
+	if err != nil {
+		t.Fatalf("Core 4 enrollment invitation rejected: %v", err)
+	}
+	if inv.Version != dollnetwork.ProtocolVersion {
+		t.Fatalf("version = %d, want %d (absent version defaults to the current protocol)", inv.Version, dollnetwork.ProtocolVersion)
+	}
+	if inv.InvitationID != "id_1" || inv.InvitationSecret != "secret_1" {
+		t.Fatalf("id/secret mismatch: %+v", inv)
+	}
+}
+
+func TestLoadEnrollmentInvitation_AcceptsBootstrapEndpointInvitation(t *testing.T) {
+	exp := time.Now().UTC().Format(time.RFC3339)
+	raw := "{\"invitation_id\":\"id_1\",\"invitation_secret\":\"secret_1\",\"expires_at\":\"" + exp + "\",\"bootstrap_endpoints\":[{\"url\":\"http://127.0.0.1:18080\"}]}"
+	inv, err := LoadEnrollmentInvitation(raw)
+	if err != nil {
+		t.Fatalf("enrollment invitation with bootstrap rejected: %v", err)
+	}
+	if inv.Version != dollnetwork.ProtocolVersion || len(inv.BootstrapEndpoints) != 1 {
+		t.Fatalf("unexpected parse: %+v", inv)
+	}
+}
+
+func TestLoadEnrollmentInvitation_ExplicitVersionOneAccepted(t *testing.T) {
+	exp := time.Now().UTC().Format(time.RFC3339)
+	raw := `{"version":1,"invitation_id":"id_1","invitation_secret":"secret_1","expires_at":"` + exp + `"}`
+	if _, err := LoadEnrollmentInvitation(raw); err != nil {
+		t.Fatalf("explicit supported version rejected: %v", err)
+	}
+}
+
+func TestLoadEnrollmentInvitation_RejectsUnsupportedVersion(t *testing.T) {
+	exp := time.Now().UTC().Format(time.RFC3339)
+	raw := `{"version":2,"invitation_id":"id_1","invitation_secret":"secret_1","expires_at":"` + exp + `"}`
+	if _, err := LoadEnrollmentInvitation(raw); err == nil {
+		t.Fatal("enrollment loader accepted an unsupported invitation version (fail closed)")
+	}
+}
+
+func TestLoadEnrollmentInvitation_FailsClosedOnMalformedContent(t *testing.T) {
+	exp := time.Now().UTC().Format(time.RFC3339)
+	bad := []string{
+		"{ not json",
+		`{"invitation_id":"","invitation_secret":"secret_1","expires_at":` + `"` + exp + `"` + `}`,
+		`{"invitation_secret":"secret_1","expires_at":"` + exp + `"}`,
+		`{"invitation_id":"id_1","invitation_secret":"secret_1","expires_at":"not-a-date"}`,
+	}
+	for _, raw := range bad {
+		if _, err := LoadEnrollmentInvitation(raw); err == nil {
+			t.Fatalf("enrollment loader accepted malformed invitation: %q", raw)
+		}
+	}
+}

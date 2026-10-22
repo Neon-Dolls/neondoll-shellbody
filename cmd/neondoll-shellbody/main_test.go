@@ -236,3 +236,70 @@ func TestSigintShutdown(t *testing.T) {
 		t.Fatalf("status after SIGINT missing body_id: %s", stdout)
 	}
 }
+
+// TestEnrollFailsClosedOnCorruptIdentity (regression): stageEnrollment must not
+// decide identity existence via a HasIdentity() boolean. When an existing
+// enrollment identity state file is corrupt/unreadable, --enroll-owner (and the
+// shared identity-loading path of --enroll) must FAIL CLOSED with an explicit
+// identity-state error rather than silently discarding the unreadable material
+// and minting a fresh identity. Repeating the attempt must still fail: the
+// corrupt state is never silently re-keyed.
+func TestEnrollFailsClosedOnCorruptIdentity(t *testing.T) {
+	bin := buildBin(t)
+	dir := filepath.Join(t.TempDir(), "state")
+	_ = os.MkdirAll(dir, 0o700)
+	es := filepath.Join(dir, "enrollment.json")
+	f, err := os.OpenFile(es, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatalf("open enrollment.json: %v", err)
+	}
+	if _, err := f.Write([]byte("{{ not valid enrollment identity json")); err != nil {
+		_ = f.Close()
+		t.Fatalf("write corrupt enrollment.json: %v", err)
+	}
+	_ = f.Close()
+
+	cmd := exec.Command(bin, "--enroll-owner", "--state-dir", dir, "--core-url", "http://127.0.0.1:1")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("corrupt identity state must fail closed on --enroll-owner; got success: %s", out)
+	}
+	if !bytes.Contains(out, []byte("identity state")) {
+		t.Fatalf("expected fail-closed identity-state error; got: %s", out)
+	}
+
+	// The corrupt state must not have been overwritten by a re-keyed identity:
+	// a repeat attempt must still fail closed on the same persisted corruption.
+	cmd = exec.Command(bin, "--enroll-owner", "--state-dir", dir, "--core-url", "http://127.0.0.1:1")
+	out, err = cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("corrupt identity must not be silently re-keyed; second attempt succeeded: %s", out)
+	}
+}
+
+// TestEnrollCreatesIdentityOnlyWhenAbsent (regression): with genuinely absent
+// identity state (no enrollment.json yet, as on a first enrollment), the
+// identity-loading path MUST create and persist a fresh identity and proceed to
+// the next gate (the body --init check) instead of failing closed.
+func TestEnrollCreatesIdentityOnlyWhenAbsent(t *testing.T) {
+	bin := buildBin(t)
+	dir := filepath.Join(t.TempDir(), "state")
+	_ = os.MkdirAll(dir, 0o700)
+
+	// Fresh state: --enroll-owner may mint+persist a fresh enrollment identity,
+	// but must then stop at the body-init gate (no Body identity yet).
+	out, err := exec.Command(bin, "--enroll-owner", "--state-dir", dir, "--core-url", "http://127.0.0.1:1").CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected enrollment to stop at the pre-init gate, got success: %s", out)
+	}
+	if !bytes.Contains(out, []byte("run --init first")) {
+		t.Fatalf("expected the \"run --init first\" gate; got: %s", out)
+	}
+	raw, rerr := os.ReadFile(filepath.Join(dir, "enrollment.json"))
+	if rerr != nil {
+		t.Fatalf("absent-state path should have persisted a fresh identity to enrollment.json: %v", rerr)
+	}
+	if !bytes.Contains(raw, []byte("identity_seed_b64")) {
+		t.Fatalf("persisted enrollment identity missing identity_seed_b64")
+	}
+}

@@ -37,6 +37,31 @@ Deliberately **not** implemented yet (later milestones):
 - Relay
 
 ---
+
+## Core 4 enrollment + M10.5 deployment proof
+
+The Shell Body can enroll with a real Core 4 instance through its public
+identity discovery (`GET /v1/core/identity`) using either ceremony:
+
+- `--enroll <invitation.json> --core-url <url>` — invitation redemption
+  (`neondollctl body invite`), or
+- `--enroll-owner --core-url <url>` — the real owner-approved ceremony: prints
+  the approval code, which the owner redeems with
+  `neondollctl body approve CODE`, then polls `result`, binds the receipt to the
+  resolved trust anchor and persists it.
+
+`--serve <ws://…/ws>` runs a persistent authenticated execution session that
+reconnects automatically after a Core restart using the persisted identity (no
+re-enrollment).
+
+`test/deploy/run_m10_5_harness.sh` proves the whole independent-process
+deployment story against **prebuilt** real binaries — see
+[`M10_5_DEPLOYMENT.md`](./M10_5_DEPLOYMENT.md) for the harness itself, the exact
+reproduce commands, and the one **blocked** step (guard-authorized shell
+execution is unavailable in the released Core; the smallest Core-side follow-up
+is specified there). The harness is opt-in and not part of `go test ./...`.
+
+---
 ## Build
 
 Requires Go 1.25+.

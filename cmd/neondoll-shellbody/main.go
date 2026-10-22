@@ -57,6 +57,7 @@ func run(args []string) error {
 	pairMode := fs.String("pair", "", "pair with a Core by consuming an invitation JSON file, then exit")
 	connectMode := fs.Bool("connect", false, "establish a WireGuard tunnel to the paired Core using persisted state")
 	enrollMode := fs.String("enroll", "", "enroll as a Body with a Core 4 instance by consuming an invitation JSON file (requires --core-url; Core identity is discovered via GET /v1/core/identity unless --core-id/--core-key are supplied)")
+	enrollOwnerMode := fs.Bool("enroll-owner", false, "run the owner-approved Core 4 enrollment ceremony: begin a body_request, print the approval code for `neondollctl body approve CODE`, poll until the owner's decision is recorded, and persist the receipt (requires --core-url; discovers Core identity unless --core-id/--core-key are supplied)")
 	serveMode := fs.String("serve", "", "run a Core 4 Doll Link execution session against a Core ws URL (e.g. ws://host:port/ws)")
 
 	// Options.
@@ -97,6 +98,8 @@ func run(args []string) error {
 		return pair(store, *pairMode)
 	case *enrollMode != "":
 		return enroll(store, *enrollMode, *coreURL, *coreID, *coreKey)
+	case *enrollOwnerMode:
+		return enrollOwner(store, *coreURL, *coreID, *coreKey)
 	case *serveMode != "":
 		return serve(store, *serveMode)
 	case *connectMode:
@@ -297,6 +300,127 @@ func pair(store *body.Store, invitationFile string) error {
 	return nil
 }
 
+// enrollStage bundles the durable identity, WireGuard key rendering, resolved
+// Core trust anchor, and HTTP/context plumbing shared by both enrollment
+// ceremonies. Extracting it keeps the trust-binding policy identical whether
+// the Body enrolls by invitation redemption or by the owner-approved begin /
+// approve / result ceremony.
+type enrollStage struct {
+	EnrSt  *enrollment.Store
+	EnrID  *enrollment.Identity
+	WGStd  string
+	HC     *http.Client
+	Ctx    context.Context
+	Stop   func()
+	Trust  *enrollment.CoreTrustResolution
+	CorePK ed25519.PublicKey
+	Cli    *enrollment.Client
+}
+
+// stageEnrollment loads (or creates) the durable enrollment identity, renders
+// the Body's WireGuard public key, resolves Core's trust anchor, and builds an
+// enrollment client. Callers MUST invoke st.Stop() (or defer it) once done.
+func stageEnrollment(store *body.Store, coreURL, coreID, coreKeyRaw string) (*enrollStage, error) {
+	enrStore := enrollment.NewStore(store.Dir())
+	// Load (or create) the durable enrollment Ed25519 identity. Only genuinely
+	// absent identity state — the identity file does not exist, as on a first
+	// enrollment — may mint a fresh identity. Any other load failure (corrupt
+	// seed, unreadable file, incomplete persisted state) fails closed: we never
+	// silently discard existing identity material and re-key a Body that may
+	// already be enrolled with a Core.
+	var enrIdent *enrollment.Identity
+	var err error
+	enrIdent, err = enrStore.LoadIdentity()
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("enrollment: failed to read existing identity state: %w", err)
+		}
+		enrIdent, err = enrollment.NewIdentity()
+		if err != nil {
+			return nil, err
+		}
+		if err := enrStore.SaveIdentity(enrIdent); err != nil {
+			return nil, err
+		}
+	}
+
+	// Render the Body's WireGuard public key in the canonical Doll Network
+	// wg_public_key form (STANDARD base64 of the 32-byte X25519 key).
+	_, kp, err := store.LoadOrError()
+	if err != nil {
+		if errors.Is(err, body.ErrStateNotFound) {
+			return nil, errors.New("run --init first to create a Body identity + WireGuard key")
+		}
+		return nil, err
+	}
+	wgStd := kp.PublicKeyBase64()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	hc := &http.Client{Timeout: 30 * time.Second}
+
+	// Resolve Core's trust anchor. Discovery is the default bootstrap path and
+	// any operator-supplied --core-key / --core-id is cross-checked against the
+	// live document; the policy also refuses to silently replace an existing
+	// pinned anchor. Discovery alone never establishes trust — the anchor is
+	// bound later by receipt signature verification inside whichever ceremony
+	// runs.
+	var existing *enrollment.Record
+	loaded, lerr := enrStore.LoadRecord()
+	if lerr != nil {
+		// Only ErrStateNotFound means "no existing enrollment" (fresh state).
+		// Any other error — corrupt or unreadable state file — fails closed so
+		// we never silently discard an unverifiable trust anchor and re-enroll.
+		if !errors.Is(lerr, enrollment.ErrStateNotFound) {
+			return nil, fmt.Errorf("enrollment: failed to read existing enrollment state: %w", lerr)
+		}
+	} else {
+		existing = loaded
+	}
+	res, err := enrollment.ResolveCoreTrust(ctx, hc, coreURL, coreID, coreKeyRaw, existing)
+	if err != nil {
+		stop()
+		return nil, err
+	}
+	corePub := ed25519.PublicKey(res.PublicKey)
+	cli := enrollment.NewClient(coreURL, res.CoreID, enrIdent, wgStd, hc)
+	return &enrollStage{
+		EnrSt: enrStore, EnrID: enrIdent, WGStd: wgStd, HC: hc, Ctx: ctx, Stop: stop,
+		Trust: res, CorePK: corePub, Cli: cli,
+	}, nil
+}
+
+// persistEnrollment binds the resolved Core trust anchor to the Core-signed
+// receipt, persists the record, and prints the enrolled identity. This is the
+// single completion path for both enrollment ceremonies. It refuses a receipt
+// whose signature does not verify under the resolved public key or that names
+// a different Core ID (identity mismatch / invalid signature — both rejected).
+func persistEnrollment(st *enrollStage, receipt *enrollment.EnrollmentReceipt) error {
+	if err := enrollment.VerifyEnrollmentReceipt(st.CorePK, *receipt); err != nil {
+		return fmt.Errorf("enrollment: Core receipt failed trust-anchor verification: %w", err)
+	}
+	if receipt.CoreID != st.Trust.CoreID {
+		return fmt.Errorf("enrollment: Core identity mismatch: resolved %s, receipt %s", st.Trust.CoreID, receipt.CoreID)
+	}
+	record := &enrollment.Record{
+		CoreID:                   receipt.CoreID,
+		CorePublicKey:            enrollment.EncodeRawURL(st.Trust.PublicKey),
+		BodyID:                   receipt.BodyID,
+		BodyPublicKeyFingerprint: receipt.BodyPublicKeyFingerprint,
+		MembershipReference:      receipt.MembershipReference,
+		Permissions:              receipt.Permissions,
+		Receipt:                  *receipt,
+		EnrolledAt:               time.Now(),
+	}
+	if err := st.EnrSt.SaveRecord(record); err != nil {
+		return err
+	}
+	fmt.Printf("enrolled body_id=%s\n", receipt.BodyID)
+	fmt.Printf("membership_reference=%s\n", receipt.MembershipReference)
+	fmt.Printf("core_id=%s\n", receipt.CoreID)
+	fmt.Printf("permissions=%v\n", receipt.Permissions)
+	return nil
+}
+
 // enroll consumes a Core 4 invitation and runs the canonical signed enrollment
 // redemption flow (Core 4 Body enrollment v1). By default it resolves Core's
 // trust anchor by identity discovery (GET /v1/core/identity); the operator may
@@ -313,104 +437,81 @@ func enroll(store *body.Store, invitationFile, coreURL, coreID, coreKeyRaw strin
 	if err != nil {
 		return fmt.Errorf("failed to read invitation %s: %w", invitationFile, err)
 	}
-	inv, err := body.LoadInvitation(string(raw))
+	// Core 4 enrollment invitations (created by `neondollctl body invite`)
+	// omit the legacy `version` field and advertise no bootstrap endpoint; load
+	// them with the enrollment invitation contract rather than the pairing one.
+	inv, err := body.LoadEnrollmentInvitation(string(raw))
 	if err != nil {
 		return fmt.Errorf("invalid invitation: %w", err)
 	}
 
-	// Load (or create) the durable enrollment Ed25519 identity.
-	enrStore := enrollment.NewStore(store.Dir())
-	var enrIdent *enrollment.Identity
-	if enrStore.HasIdentity() {
-		enrIdent, err = enrStore.LoadIdentity()
-		if err != nil {
-			return err
-		}
-	} else {
-		enrIdent, err = enrollment.NewIdentity()
-		if err != nil {
-			return err
-		}
-		if err := enrStore.SaveIdentity(enrIdent); err != nil {
-			return err
-		}
-	}
-
-	// Render the Body's WireGuard public key in the canonical Doll Network
-	// wg_public_key form (STANDARD base64 of the 32-byte X25519 key).
-	_, kp, err := store.LoadOrError()
-	if err != nil {
-		if errors.Is(err, body.ErrStateNotFound) {
-			return errors.New("run --init first to create a Body identity + WireGuard key")
-		}
-		return err
-	}
-	wgStd := kp.PublicKeyBase64()
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	hc := &http.Client{Timeout: 30 * time.Second}
-
-	// Resolve Core's trust anchor. Discovery is the default bootstrap path and
-	// any operator-supplied --core-key / --core-id is cross-checked against the
-	// live document; the policy also refuses to silently replace an existing
-	// pinned anchor. Discovery alone never establishes trust — the anchor is
-	// bound below by receipt signature verification inside the owner-approved
-	// redemption ceremony.
-	var existing *enrollment.Record
-	loaded, lerr := enrStore.LoadRecord()
-	if lerr != nil {
-		// Only ErrStateNotFound means "no existing enrollment" (fresh state).
-		// Any other error — corrupt or unreadable state file — fails closed so
-		// we never silently discard an unverifiable trust anchor and re-enroll.
-		if !errors.Is(lerr, enrollment.ErrStateNotFound) {
-			return fmt.Errorf("enrollment: failed to read existing enrollment state: %w", lerr)
-		}
-	} else {
-		existing = loaded
-	}
-	res, err := enrollment.ResolveCoreTrust(ctx, hc, coreURL, coreID, coreKeyRaw, existing)
+	st, err := stageEnrollment(store, coreURL, coreID, coreKeyRaw)
 	if err != nil {
 		return err
 	}
-	corePub := ed25519.PublicKey(res.PublicKey)
+	defer st.Stop()
 
-	client := enrollment.NewClient(coreURL, res.CoreID, enrIdent, wgStd, hc)
-	receipt, err := client.Redeem(ctx, inv.InvitationID, inv.InvitationSecret)
+	receipt, err := st.Cli.Redeem(st.Ctx, inv.InvitationID, inv.InvitationSecret)
 	if err != nil {
 		return fmt.Errorf("enrollment failed: %w", err)
 	}
+	return persistEnrollment(st, receipt)
+}
 
-	// Bind the resolved identity to the enrollment: the receipt must verify
-	// under the resolved public key AND name the same Core ID. Either failing
-	// means an identity mismatch or an invalid signature, both rejected.
-	if err := enrollment.VerifyEnrollmentReceipt(corePub, *receipt); err != nil {
-		return fmt.Errorf("enrollment: Core receipt failed trust-anchor verification: %w", err)
-	}
-	if receipt.CoreID != res.CoreID {
-		return fmt.Errorf("enrollment: Core identity mismatch: resolved %s, receipt %s", res.CoreID, receipt.CoreID)
+// enrollOwner runs the real owner-approved enrollment ceremony. It begins a
+// body_request-mode enrollment, prints the human approval code that Core
+// issued — which the owner redeems against the Core admin socket with
+// `neondollctl body approve CODE [-permissions ...]` — then polls the terminal
+// status until the owner's decision is recorded. On approval the returned
+// receipt is bound to the resolved trust anchor and persisted exactly as the
+// invitation path. It fails closed if the owner denies or the pending expires,
+// and never bypasses owner approval.
+func enrollOwner(store *body.Store, coreURL, coreID, coreKeyRaw string) error {
+	if coreURL == "" {
+		return errors.New("--enroll-owner requires --core-url")
 	}
 
-	record := &enrollment.Record{
-		CoreID:                   receipt.CoreID,
-		CorePublicKey:            enrollment.EncodeRawURL(res.PublicKey),
-		BodyID:                   receipt.BodyID,
-		BodyPublicKeyFingerprint: receipt.BodyPublicKeyFingerprint,
-		MembershipReference:      receipt.MembershipReference,
-		Permissions:              receipt.Permissions,
-		Receipt:                  *receipt,
-		EnrolledAt:               time.Now(),
-	}
-	if err := enrStore.SaveRecord(record); err != nil {
+	st, err := stageEnrollment(store, coreURL, coreID, coreKeyRaw)
+	if err != nil {
 		return err
 	}
+	defer st.Stop()
 
-	fmt.Printf("enrolled body_id=%s\n", receipt.BodyID)
-	fmt.Printf("membership_reference=%s\n", receipt.MembershipReference)
-	fmt.Printf("core_id=%s\n", receipt.CoreID)
-	fmt.Printf("permissions=%v\n", receipt.Permissions)
-	return nil
+	pending, err := st.Cli.Begin(st.Ctx)
+	if err != nil {
+		return fmt.Errorf("enrollment failed: %w", err)
+	}
+	fmt.Printf("pending approval_code=%s request_id=%s core_id=%s\n",
+		pending.ApprovalCode, pending.RequestID, pending.CoreID)
+
+	// Bound, cancellation-aware poll of the terminal status. Core consumes a
+	// fresh nonce per poll and limits attempts; stay within that budget.
+	for i := 0; i < 8; i++ {
+		if errors.Is(st.Ctx.Err(), context.Canceled) {
+			return context.Canceled
+		}
+		time.Sleep(2 * time.Second)
+		resp, err := st.Cli.Result(st.Ctx)
+		if err != nil {
+			return fmt.Errorf("enrollment: poll result: %w", err)
+		}
+		if resp.Status == enrollment.StatusEnrolled {
+			if resp.Receipt == nil {
+				return errors.New("enrollment: enrolled response missing receipt")
+			}
+			return persistEnrollment(st, resp.Receipt)
+		}
+		if resp.Status == enrollment.StatusDenied {
+			return errors.New("enrollment: denied by owner")
+		}
+		if resp.Status == enrollment.StatusExpired {
+			return errors.New("enrollment: expired before approval")
+		}
+		if resp.Status != enrollment.StatusPending {
+			return fmt.Errorf("enrollment: unexpected status %q", resp.Status)
+		}
+	}
+	return errors.New("enrollment: owner did not approve within the attempt budget")
 }
 
 // serve runs a canonical Core 4 Doll Link execution session: it connects to
