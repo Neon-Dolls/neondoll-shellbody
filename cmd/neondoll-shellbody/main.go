@@ -321,16 +321,20 @@ type enrollStage struct {
 // the Body's WireGuard public key, resolves Core's trust anchor, and builds an
 // enrollment client. Callers MUST invoke st.Stop() (or defer it) once done.
 func stageEnrollment(store *body.Store, coreURL, coreID, coreKeyRaw string) (*enrollStage, error) {
-	// Load (or create) the durable enrollment Ed25519 identity.
 	enrStore := enrollment.NewStore(store.Dir())
+	// Load (or create) the durable enrollment Ed25519 identity. Only genuinely
+	// absent identity state — the identity file does not exist, as on a first
+	// enrollment — may mint a fresh identity. Any other load failure (corrupt
+	// seed, unreadable file, incomplete persisted state) fails closed: we never
+	// silently discard existing identity material and re-key a Body that may
+	// already be enrolled with a Core.
 	var enrIdent *enrollment.Identity
 	var err error
-	if enrStore.HasIdentity() {
-		enrIdent, err = enrStore.LoadIdentity()
-		if err != nil {
-			return nil, err
+	enrIdent, err = enrStore.LoadIdentity()
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("enrollment: failed to read existing identity state: %w", err)
 		}
-	} else {
 		enrIdent, err = enrollment.NewIdentity()
 		if err != nil {
 			return nil, err

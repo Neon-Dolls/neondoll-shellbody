@@ -263,16 +263,45 @@ n="$(grep -Ec "authenticated with Core as body_id=${BODY1_ID}" "$WORK/serve.log"
 [[ "$n" -gt "$AUTH_BEFORE_RESTART" ]] || die "Body did not reconnect after Core restart (no new authenticated line)"
 step 6 "ok: reconnected after restart using persisted identity (no re-enrollment); authenticated lines: $n"
 
-# ── Step 7: revoke the Body; subsequent authentication denied ─────────────
-step 7 "revoke the Body and verify subsequent authentication/execution is denied"
+# ── Step 7: revoke the Body; a FRESH authentication must be rejected ─────────
+step 7 "revoke the Body; verify a FRESH authentication is explicitly rejected by the real Core"
 AUTH_BEFORE_REVOKE="$(grep -Ec "authenticated with Core as body_id=${BODY1_ID}" "$WORK/serve.log" || true)"
-REVOKE_OUT="$("${CTL[@]}" body revoke "$BODY1_ID" 2>&1)" || { echo "--- revoke.err ---"; echo "$REVOKE_OUT"; die "body revoke failed"; }
-echo "       revoke returned: ${REVOKE_OUT:-204 No Content}"
-# Core evicts the connected session; the Body retries but must NOT re-authenticate.
-if ! no_new_match_in "$WORK/serve.log" "authenticated with Core as body_id=${BODY1_ID}" 10 "$AUTH_BEFORE_REVOKE"; then
-  die "revoked Body re-authenticated (security regression)"
+"${CTL[@]}" body revoke "$BODY1_ID" >"$WORK/revoke.log" 2>&1 || { echo "--- revoke.err ---"; cat "$WORK/revoke.log"; die "body revoke failed"; }
+echo "       revoke: $(tr -d '\n' <"$WORK/revoke.log" | head -c 140)"
+echo "       terminate the previously-authenticated session so a FRESH handshake is required..."
+kill "$BODY_PID" 2>/dev/null || true
+for _ in 1 2 3 4 5; do kill -0 "$BODY_PID" 2>/dev/null || break; sleep 0.3; done
+BODY_PID=""
+# Start a brand-new --serve process: a fresh, real authentication attempt using
+# the revoked Body's persisted identity. We assert Core OVERTLY rejects it (an
+# explicit rejection signal or a fail-closed non-zero exit) — not merely the
+# absence of a successful-authentication log line.
+"$NEONDOLL_SHELLBODY" --serve "$WS_URL" --state-dir "$BODY1" >"$WORK/serve_revoked.log" 2>&1 &
+NEW_PID=$!
+REJECT_RE='denied|reject|not accepted|permanent|revoked|forbidden|forbid|unauthor'
+explicit_reject=0; authenticated=0
+for _ in $(seq 1 24); do
+  if grep -Eq 'authenticated with Core as body_id=' "$WORK/serve_revoked.log" 2>/dev/null; then authenticated=1; fi
+  if grep -Ei "$REJECT_RE" "$WORK/serve_revoked.log" 2>/dev/null; then explicit_reject=1; fi
+  if ! kill -0 "$NEW_PID" 2>/dev/null; then break; fi
+  sleep 0.5
+done
+NEW_RC=-1
+if ! kill -0 "$NEW_PID" 2>/dev/null; then
+  if wait "$NEW_PID"; then NEW_RC=0; else NEW_RC=$?; fi
+else
+  kill "$NEW_PID" 2>/dev/null || true; for _ in 1 2 3 4 5; do kill -0 "$NEW_PID" 2>/dev/null || break; sleep 0.3; done; true
 fi
-echo "       no new authenticated line after revoke (auth denied)"
+echo "       fresh --serve exit_code=${NEW_RC:-alive}  explicit_reject=$explicit_reject  authenticated=$authenticated"
+echo "       --- serve_revoked.log (fresh auth attempt) ---"
+sed -n '1,40p' "$WORK/serve_revoked.log" || true
+if [[ "$authenticated" == "1" ]]; then
+  die "revoked Body AUTHENTICATED on a fresh connection (security regression)"
+fi
+if [[ "$explicit_reject" != "1" ]]; then
+  die "the real Core did not OVERTLY reject the revoked Body's fresh authentication (no explicit denial signal / permanent failure)"
+fi
+step 7 "ok: real Core explicitly rejected a FRESH authentication by the revoked Body (exit=${NEW_RC}, reject signal present)"
 # Best-effort: Core reflects the revocation in body list.
 if "${CTL[@]}" body list 2>&1 | grep -q '"status" *: *"revoked"\|revoked'; then
   echo "       Core body list reflects revocation"

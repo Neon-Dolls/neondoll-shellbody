@@ -45,7 +45,7 @@ go build -o /tmp/bin/neondoll-shellbody ./cmd/neondoll-shellbody
 | 4 | Authenticated Body session + capability advertisement | `--serve ws://…/ws`, waits for `authenticated with Core as body_id=…` | PASS |
 | 5 | Authorized shell execution through Core's Guard, result returned | **BLOCKED** (below) — probed honestly, not simulated | BLOCKED |
 | 6 | Terminate + restart Core; Body reconnects with persisted identity, no re-enroll | SIGTERM daemon; restart on same data dir; assert core identity stable; Body emits a new `authenticated` line (no `--enroll`) | PASS (auth 1→2 lines) |
-| 7 | Revoke the Body; subsequent auth/exec denied | `neondollctl body revoke <id>` → status `revoked`; assert **no new** `authenticated` line after revoke | PASS |
+| 7 | Revoke the Body; a **fresh** auth attempt is explicitly rejected | `neondollctl body revoke <id>` → status `revoked`; start a new `--serve`, which **fails closed** against the real Core: `permanent failure during authenticate … ws close 1006`, exit 1, no `authenticated` line | PASS |
 
 The harness waits on observable readiness (`neondoll started:` daemon line,
 `authenticated with Core as body_id=…` body line) and a `trap`-based `cleanup`
@@ -136,7 +136,9 @@ All are covered by unit tests in `internal/enrollment/client_test.go` and
               => BLOCKED (documented)
 [step 6]      core identity stable across restart: core_68b692e7…
               reconnected using persisted identity (authenticated lines: 2)
-[step 7]      revoke -> status revoked ; no new authenticated line (auth denied)
+[step 7]      revoke -> status revoked
+              fresh --serve exit_code=1 explicit_reject=1 authenticated=0
+              body: permanent failure during authenticate (real Core rejected the handshake)
 ```
 
 ## Repository state
