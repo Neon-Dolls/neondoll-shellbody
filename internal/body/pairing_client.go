@@ -116,6 +116,44 @@ func validateInvitationShape(inv *dollnetwork.Invitation) error {
 	return nil
 }
 
+// LoadEnrollmentInvitation parses and validates a Core 4 enrollment
+// invitation document (the output of `neondollctl body invite`). Unlike the
+// legacy pairing invitation, the Core 4 enrollment invitation omits the
+// `version` field (the enrollment ceremony is version 1 by endpoint contract)
+// and does not require a bootstrap endpoint (the enrolling Body reaches Core
+// directly through the URL passed separately to --enroll/--core-url). We
+// therefore treat an absent version as the current protocol version and do
+// not require bootstrap_endpoints, while still validating id, secret and
+// expiry so a malformed or stale document fails closed.
+func LoadEnrollmentInvitation(raw string) (*dollnetwork.Invitation, error) {
+	var inv dollnetwork.Invitation
+	if err := json.Unmarshal([]byte(raw), &inv); err != nil {
+		return nil, &PairingError{Op: "parse invitation", Cause: err}
+	}
+	if inv.Version == 0 {
+		inv.Version = dollnetwork.ProtocolVersion
+	}
+	if inv.InvitationID == "" {
+		return nil, &PairingError{Op: "validate invitation", Cause: errors.New("missing invitation id")}
+	}
+	if inv.InvitationSecret == "" {
+		return nil, &PairingError{Op: "validate invitation", Cause: errors.New("missing invitation secret")}
+	}
+	if _, err := time.Parse(time.RFC3339, inv.ExpiresAt); err != nil {
+		return nil, &PairingError{
+			Op:    "validate invitation",
+			Cause: fmt.Errorf("invitation expires_at %q is not RFC3339: %v", inv.ExpiresAt, err),
+		}
+	}
+	if inv.Version != dollnetwork.ProtocolVersion {
+		return nil, &PairingError{
+			Op:    "validate invitation",
+			Cause: fmt.Errorf("unsupported invitation version %d", inv.Version),
+		}
+	}
+	return &inv, nil
+}
+
 // invitationExpired reports whether the invitation has expired as of `now`
 // (a Unix timestamp).
 func invitationExpired(inv *dollnetwork.Invitation, now int64) bool {

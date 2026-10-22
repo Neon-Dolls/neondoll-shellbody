@@ -21,6 +21,12 @@ type coreStub struct {
 	coreID   string
 	receipt  EnrollmentReceipt
 	seen     *int
+	// lastNonce/secondLastNonce track recently-seen result nonces and
+	// resultReplays mirrors Core's per-nonce anti-replay (ConsumeResultNonce):
+	// a poll reusing a nonce must be rejected, proving fresh-nonce polling.
+	lastNonce       string
+	secondLastNonce string
+	resultReplays   int
 }
 
 func newTestCoreStub(t *testing.T) *coreStub {
@@ -122,6 +128,15 @@ func (s *coreStub) handleResult(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "invalid_proof", err.Error())
 		return
 	}
+	// Anti-replay: Core refuses to consume a result nonce twice. Mirror that
+	// so reusing a poll nonce fails the round trip exactly as Core would.
+	if req.BodyNonce == s.lastNonce || req.BodyNonce == s.secondLastNonce {
+		s.resultReplays++
+		writeError(w, 409, "replayed", "reused result nonce")
+		return
+	}
+	s.secondLastNonce = s.lastNonce
+	s.lastNonce = req.BodyNonce
 	receipt := s.receipt
 	receipt.RequestID = req.RequestID
 	receipt.CoreID = s.coreID
@@ -236,5 +251,42 @@ func TestClientBeginThenResult(t *testing.T) {
 	}
 	if res.Status != StatusEnrolled {
 		t.Fatalf("expected enrolled, got %q", res.Status)
+	}
+}
+
+// TestClientResultUsesFreshNoncePerPoll guards the Core 4 contract that the
+// /v1/body/enrollment/result route consumes and anti-replays each poll nonce
+// (ConsumeResultNonce). The client must reuse the pinned requestID but present
+// a FRESH nonce on every poll; a prior implementation reused the Begin nonce,
+// which the real Core rejects as `replayed` on the second poll. The stub
+// mirrors Core by answering 409 when a poll nonce is repeated, so this test
+// fails on the regression and passes once each poll mints a new nonce.
+func TestClientResultUsesFreshNoncePerPoll(t *testing.T) {
+	stub := newTestCoreStub(t)
+	srv := httptest.NewServer(stub.handler())
+	defer srv.Close()
+
+	id, err := NewIdentity()
+	if err != nil {
+		t.Fatalf("identity: %v", err)
+	}
+	client := NewClient(srv.URL, stub.coreID, id, base64.StdEncoding.EncodeToString(randomBytes(nonceSize)), nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := client.Begin(ctx); err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		res, err := client.Result(ctx)
+		if err != nil {
+			t.Fatalf("result poll %d: %v", i, err)
+		}
+		if res.Status != StatusEnrolled {
+			t.Fatalf("poll %d status = %q, want enrolled", i, res.Status)
+		}
+	}
+	if stub.resultReplays != 0 {
+		t.Fatalf("Result reused a poll nonce (real Core would 409): %d rejections", stub.resultReplays)
 	}
 }
