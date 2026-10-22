@@ -148,7 +148,14 @@ func ResolveCoreTrust(ctx context.Context, hc *http.Client, baseURL, explicitCor
 		if explicitPub == nil || explicitCoreID == "" {
 			return nil, err
 		}
-		return &CoreTrustResolution{CoreID: explicitCoreID, PublicKey: *explicitPub}, nil
+		// The explicit anchor is a valid trust input, but it is still subject
+		// to the same pinning checks as any other successful resolution:
+		// never silently replace an existing enrollment's trust anchor.
+		resolution := CoreTrustResolution{CoreID: explicitCoreID, PublicKey: *explicitPub}
+		if perr := checkPinnedAnchor(existing, &resolution); perr != nil {
+			return nil, perr
+		}
+		return &resolution, nil
 	}
 
 	// Discovery succeeded: cross-check any explicit expectations.
@@ -166,18 +173,36 @@ func ResolveCoreTrust(ctx context.Context, hc *http.Client, baseURL, explicitCor
 	resolution := CoreTrustResolution{CoreID: discovered.CoreID, PublicKey: resolvedPub}
 
 	// Never silently replace an existing trust anchor.
-	if existing != nil {
-		if existing.CoreID != "" && existing.CoreID != resolution.CoreID {
-			return nil, fmt.Errorf("%w: refusing to replace existing enrollment pinned to core %q with core %q (move Cores by enrolling into a fresh state directory)", ErrCoreIdentityRejected, existing.CoreID, resolution.CoreID)
-		}
-		if existing.CorePublicKey != "" {
-			exPub, dErr := decodeEd25519Pubkey(existing.CorePublicKey)
-			if dErr == nil && !pubBytesEqual(exPub, resolution.PublicKey) {
-				return nil, fmt.Errorf("%w: refusing to replace the existing core trust anchor with a different public key", ErrCoreIdentityRejected)
-			}
-		}
+	if perr := checkPinnedAnchor(existing, &resolution); perr != nil {
+		return nil, perr
 	}
 	return &resolution, nil
+}
+
+// checkPinnedAnchor applies the trust-pinning invariants to a resolved trust
+// anchor (discovered or explicitly supplied). It must run on EVERY successful
+// resolution path so that an existing enrollment is never silently redirected
+// to a different Core. It also fails closed if the stored anchor is corrupt:
+// a persisted but malformed CorePublicKey is never ignored, it is rejected.
+func checkPinnedAnchor(existing *Record, resolution *CoreTrustResolution) error {
+	if existing == nil {
+		return nil
+	}
+	if existing.CoreID != "" && existing.CoreID != resolution.CoreID {
+		return fmt.Errorf("%w: refusing to replace existing enrollment pinned to core %q with core %q (move Cores by enrolling into a fresh state directory)", ErrCoreIdentityRejected, existing.CoreID, resolution.CoreID)
+	}
+	if existing.CorePublicKey != "" {
+		exPub, dErr := decodeEd25519Pubkey(existing.CorePublicKey)
+		if dErr != nil {
+			// A persisted but malformed trust anchor must never be silently
+			// ignored or replaced: fail closed on the corrupt stored key.
+			return fmt.Errorf("%w: existing enrollment stores an invalid core trust anchor (corrupt public key); refusing to resolve a replacement", ErrCoreIdentityRejected)
+		}
+		if !pubBytesEqual(exPub, resolution.PublicKey) {
+			return fmt.Errorf("%w: refusing to replace the existing core trust anchor with a different public key", ErrCoreIdentityRejected)
+		}
+	}
+	return nil
 }
 
 // pubBytesEqual compares two fixed-size byte buffers (public keys).

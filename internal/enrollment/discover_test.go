@@ -355,3 +355,39 @@ func TestResolveTrustOfflineExplicitAnchor(t *testing.T) {
 		t.Fatalf("offline explicit key not used")
 	}
 }
+
+// TestResolveTrustOfflineNeverReplacesDifferentKey (regression): the offline
+// explicit-anchor fallback must be subject to the SAME pinning checks as the
+// discovery path. With Core unreachable, an explicit anchor must still never
+// silently redirect an existing enrollment pinned to a different key.
+func TestResolveTrustOfflineNeverReplacesDifferentKey(t *testing.T) {
+	id, _ := validIdentity()
+	_, explicitKey := genKey(t)
+	_, storedOtherKey := genKey(t)
+	srv := httptest.NewServer(stubbingStatus(id, 503).handler())
+	defer srv.Close()
+	ctx, cancel := nowContext()
+	defer cancel()
+	existing := minimalRecord("core_explicit", storedOtherKey)
+	_, err := ResolveCoreTrust(ctx, nil, srv.URL, "core_explicit", explicitKey, existing)
+	if err == nil {
+		t.Fatal("expected rejection: offline fallback must not replace an existing pinned key")
+	}
+}
+
+// TestResolveTrustMalformedStoredKeyFailsClosed (regression): a persisted but
+// malformed CorePublicKey must never be silently ignored at resolution time.
+// The resolution fails closed on the corrupt stored anchor rather than
+// proceeding against an unverifiable trust anchor.
+func TestResolveTrustMalformedStoredKeyFailsClosed(t *testing.T) {
+	id, _ := validIdentity()
+	srv := httptest.NewServer(stub(id).handler())
+	defer srv.Close()
+	ctx, cancel := nowContext()
+	defer cancel()
+	existing := minimalRecord(id.CoreID, "!!!not-a-pubkey!!!")
+	_, err := ResolveCoreTrust(ctx, nil, srv.URL, "", "", existing)
+	if err == nil {
+		t.Fatal("expected rejection: malformed persisted trust anchor must fail closed")
+	}
+}
