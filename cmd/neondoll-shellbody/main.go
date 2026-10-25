@@ -28,6 +28,7 @@ import (
 	"github.com/Neon-Dolls/neondoll-shellbody/internal/execution"
 	"github.com/Neon-Dolls/neondoll-shellbody/internal/execution/process"
 	"github.com/Neon-Dolls/neondoll-shellbody/internal/identity"
+	"github.com/Neon-Dolls/neondoll-shellbody/internal/interaction"
 	"github.com/Neon-Dolls/neondoll-shellbody/internal/terminal"
 	"github.com/Neon-Dolls/neondoll-shellbody/internal/tunnel"
 )
@@ -59,6 +60,8 @@ func run(args []string) error {
 	enrollMode := fs.String("enroll", "", "enroll as a Body with a Core 4 instance by consuming an invitation JSON file (requires --core-url; Core identity is discovered via GET /v1/core/identity unless --core-id/--core-key are supplied)")
 	enrollOwnerMode := fs.Bool("enroll-owner", false, "run the owner-approved Core 4 enrollment ceremony: begin a body_request, print the approval code for `neondollctl body approve CODE`, poll until the owner's decision is recorded, and persist the receipt (requires --core-url; discovers Core identity unless --core-id/--core-key are supplied)")
 	serveMode := fs.String("serve", "", "run a Core 4 Doll Link execution session against a Core ws URL (e.g. ws://host:port/ws)")
+	converseMode := fs.String("converse", "", "open a real Core 5 Interaction Session and run the terminal conversation against a Core ws URL (e.g. ws://host:port/ws)")
+	dollID := fs.String("doll", "core", "which Doll to address in --converse (default: core, the Core's local Doll)")
 
 	// Options.
 	stateDir := fs.String("state-dir", ".neondoll-shellbody", "directory for durable Body state")
@@ -102,6 +105,8 @@ func run(args []string) error {
 		return enrollOwner(store, *coreURL, *coreID, *coreKey)
 	case *serveMode != "":
 		return serve(store, *serveMode)
+	case *converseMode != "":
+		return converse(store, *converseMode, *dollID)
 	case *connectMode:
 		return connect(store)
 	default:
@@ -512,6 +517,95 @@ func enrollOwner(store *body.Store, coreURL, coreID, coreKeyRaw string) error {
 		}
 	}
 	return errors.New("enrollment: owner did not approve within the attempt budget")
+}
+
+// enrollmentMaterial is the persisted evidence an enrolled Body needs to
+// authenticate to Core over the Doll Link transport: the enrollment record, the
+// enrollment identity, and the decoded Core trust anchor (Core's Ed25519 public
+// key).
+type enrollmentMaterial struct {
+	Record    *enrollment.Record
+	Identity  *enrollment.Identity
+	PublicKey []byte
+}
+
+// loadEnrollmentMaterial loads and validates the enrolled Body identity and
+// Core trust anchor. It fails closed when the record is missing, malformed, or
+// names no trust anchor — never silently minting a fresh identity.
+func loadEnrollmentMaterial(store *body.Store) (m *enrollmentMaterial, err error) {
+	enrStore := enrollment.NewStore(store.Dir())
+	record, err := enrStore.LoadRecord()
+	if err != nil {
+		if errors.Is(err, enrollment.ErrStateNotFound) {
+			return nil, errors.New("not enrolled yet (run --enroll first)")
+		}
+		return nil, err
+	}
+	if record.CoreID == "" {
+		return nil, errors.New("record has no core_id; re-run --enroll")
+	}
+	if record.CorePublicKey == "" {
+		return nil, errors.New("record has no core_public_key trust anchor; re-run --enroll")
+	}
+	corePubRaw, err := enrollment.DecodeRawURL(record.CorePublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("record core_public_key is invalid: %w", err)
+	}
+	enrIdent, err := enrStore.LoadIdentity()
+	if err != nil {
+		return nil, fmt.Errorf("load identity for authentication: %w", err)
+	}
+	return &enrollmentMaterial{Record: record, Identity: enrIdent, PublicKey: corePubRaw}, nil
+}
+
+// converse runs the Real Terminal Conversation (M11.1): it connects to Core's
+// /ws endpoint, authenticates as the enrolled Body (Body Auth v1), opens a real
+// Core 5 Interaction Session, and lets the human type lines that stream through
+// the session as message events — displaying each Doll response — then closes
+// the session cleanly on end of input (Ctrl-D / Ctrl-C).
+func converse(store *body.Store, wsURL, doll string) error {
+	if wsURL == "" {
+		return errors.New("--converse requires a Core ws URL (e.g. ws://host:port/ws)")
+	}
+
+	mat, err := loadEnrollmentMaterial(store)
+	if err != nil {
+		return err
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	creds := body.Credentials{
+		BodyID:        mat.Record.BodyID,
+		PrivateKey:    mat.Identity.PrivateKey(),
+		CoreID:        mat.Record.CoreID,
+		CorePublicKey: ed25519.PublicKey(mat.PublicKey),
+	}
+	// Open the authenticated Doll Link transport. This fails closed on a dial
+	// or auth rejection (a revoked identity is denied, never retried) and the
+	// returned handle reuses the Body's Core4Session wire + Body Auth v1.
+	fs, sessionID, err := body.DialFrameSession(ctx, wsURL, creds, execution.Advertised())
+	if err != nil {
+		return fmt.Errorf("body: dial/authenticate %s: %w", wsURL, err)
+	}
+	defer fs.Close()
+
+	that := interaction.Session{
+		Write: fs.Write,
+		Read:  fs.Read,
+		Close: fs.Close,
+	}
+
+	fmt.Printf("connected to Core %s as body_id=%s (session=%s)\n",
+		mat.Record.CoreID, mat.Record.BodyID, sessionID)
+	fmt.Fprintln(os.Stdout, "type and press Enter to talk to your Doll; Ctrl-D / Ctrl-C to close")
+
+	res, rerr := interaction.RunConversation(ctx, that, doll, os.Stdin, os.Stdout)
+	if rerr == nil && res != nil {
+		fmt.Fprintf(os.Stderr, "conversation ended (%s, %d line(s))\n", res.EndedBy, res.LinesIn)
+	}
+	return rerr
 }
 
 // serve runs a canonical Core 4 Doll Link execution session: it connects to
