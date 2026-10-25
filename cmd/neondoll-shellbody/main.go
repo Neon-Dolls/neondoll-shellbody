@@ -582,26 +582,36 @@ func converse(store *body.Store, wsURL, doll string) error {
 		CoreID:        mat.Record.CoreID,
 		CorePublicKey: ed25519.PublicKey(mat.PublicKey),
 	}
-	// Open the authenticated Doll Link transport. This fails closed on a dial
-	// or auth rejection (a revoked identity is denied, never retried) and the
-	// returned handle reuses the Body's Core4Session wire + Body Auth v1.
-	fs, sessionID, err := body.DialFrameSession(ctx, wsURL, creds, execution.Advertised())
-	if err != nil {
-		return fmt.Errorf("body: dial/authenticate %s: %w", wsURL, err)
+	// Build a Dialer that reuses the existing authenticated connection +
+	// recovery machinery: every call re-dials /ws, performs a fresh Body Auth
+	// v1 handshake, and re-advertises capabilities. RunConversation uses it for
+	// the first connect AND for each reconnect after a transport drop, so a
+	// reconnect re-authenticates rather than reusing a stale, dead socket.
+	var dials int
+	dialer := func(dctx context.Context) (interaction.Session, error) {
+		dials++
+		fs, sessionID, derr := body.DialFrameSession(dctx, wsURL, creds, execution.Advertised())
+		if derr != nil {
+			// Dial or auth failure: surfaced to RunConversation, which
+			// reuses the recovery loop's classification — retry transient
+			// failures, fail closed on rejected/revoked identity.
+			return interaction.Session{}, fmt.Errorf("body: dial/authenticate %s: %w", wsURL, derr)
+		}
+		if dials == 1 {
+			fmt.Printf("connected to Core %s as body_id=%s (session=%s)\n",
+				mat.Record.CoreID, mat.Record.BodyID, sessionID)
+		} else {
+			fmt.Printf("reconnected to Core (auth session=%s); re-selecting the shell session\n", sessionID)
+		}
+		return interaction.Session{
+			Write: fs.Write,
+			Read:  fs.Read,
+			Close: fs.Close,
+		}, nil
 	}
-	defer fs.Close()
-
-	that := interaction.Session{
-		Write: fs.Write,
-		Read:  fs.Read,
-		Close: fs.Close,
-	}
-
-	fmt.Printf("connected to Core %s as body_id=%s (session=%s)\n",
-		mat.Record.CoreID, mat.Record.BodyID, sessionID)
 	fmt.Fprintln(os.Stdout, "type and press Enter to talk to your Doll; Ctrl-D / Ctrl-C to close")
 
-	res, rerr := interaction.RunConversation(ctx, that, doll, os.Stdin, os.Stdout)
+	res, rerr := interaction.RunConversation(ctx, dialer, doll, os.Stdin, os.Stdout)
 	if rerr == nil && res != nil {
 		fmt.Fprintf(os.Stderr, "conversation ended (%s, %d line(s))\n", res.EndedBy, res.LinesIn)
 	}
