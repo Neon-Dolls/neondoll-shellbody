@@ -70,6 +70,49 @@ func DialCore4(url string, creds Credentials, adapter *execution.Adapter) (*Core
 	}, nil
 }
 
+// FrameSession is a narrow, exported view of an authenticated Core Doll Link
+// connection: write a JSON frame, read the next frame (interruptible by ctx),
+// and close. Non-execution adapters — such as the M11.1 interaction-session
+// terminal conversation — reach the Body's authenticated Doll Link transport
+// through this handle instead of the package-internal Core4Session methods.
+type FrameSession struct {
+	Write func(ctx context.Context, value any) error
+	Read  func(ctx context.Context) ([]byte, error)
+	Close func() error
+}
+
+// DialFrameSession dials Core's /ws endpoint, performs the canonical Body
+// Authentication v1 handshake, advertises the Body's capabilities, and returns
+// an exported frame transport plus the authenticated session id. It fails
+// closed on a dial or auth rejection (never retries a permanent denial) and the
+// caller is responsible for Close.
+func DialFrameSession(ctx context.Context, url string, creds Credentials, advertised []core4.Capability) (*FrameSession, string, error) {
+	sess, err := DialCore4(url, creds, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	accept, err := sess.Authenticate(ctx)
+	if err != nil {
+		_ = sess.Close()
+		return nil, "", err
+	}
+	if err := sess.AdvertiseCapabilities(ctx, advertised); err != nil {
+		_ = sess.Close()
+		return nil, "", err
+	}
+	return &FrameSession{
+		Write: func(ctx context.Context, value any) error {
+			return sess.writeJSON(ctx, value)
+		},
+		Read: func(ctx context.Context) ([]byte, error) {
+			return sess.readFrame(ctx)
+		},
+		Close: func() error {
+			return sess.Close()
+		},
+	}, accept.SessionID, nil
+}
+
 // Authenticate performs the canonical Body Authentication v1 handshake:
 //
 //	body.auth.hello  → (Core) body.auth.challenge
