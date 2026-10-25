@@ -24,11 +24,13 @@ import (
 // scripted is a Session transport that records every written frame and answers
 // each request with a canned, protocol-shaped response.
 type scripted struct {
-	responses   chan []byte
-	written     chan []byte
-	coreErr     bool // interactions reply with a system error
-	doubleReply bool // interactions reply with a decoy then the real reply
-	createErr   bool // session.create replies with a Core error
+	responses    chan []byte
+	written      chan []byte
+	coreErr      bool // interactions reply with a system error
+	doubleReply  bool // interactions reply with a decoy then the real reply
+	createErr    bool // session.create replies with a Core error
+	unsolicited  bool // interaction is prefixed with an uncorrelated (empty cid) event
+	transportErr bool // interaction Write fails (simulated connection loss)
 }
 
 func newScripted() *scripted {
@@ -67,8 +69,19 @@ func (s *scripted) session() Session {
 				_ = json.Unmarshal(frame, &cr)
 				s.responses <- okResult(cr.ID, "sess-1")
 			case "interaction":
+				if s.transportErr {
+					// Simulate mid-conversation connection loss: the frame has
+					// already been recorded in written; fail the write instead
+					// of ever answering it.
+					return fmt.Errorf("simulated transport failure")
+				}
 				var it core5.Interaction
 				_ = json.Unmarshal(frame, &it)
+				if s.unsolicited {
+					// An unsolicited push with no correlation id must be
+					// ignored, never mistaken for the reply.
+					s.responses <- msgReply("", "unsolicited push")
+				}
 				if s.coreErr {
 					s.responses <- newSystemError(it.Event.ID, "core said no")
 				} else if s.doubleReply {
@@ -331,5 +344,67 @@ func TestRunConversationCleanUpOnCancellation(t *testing.T) {
 		t.Fatalf("error after cancel: %v", err)
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for cancellation")
+	}
+}
+
+// Regression: a mid-conversation transport failure must end the conversation
+// with a returned error (ErrTransport surfaced by RunConversation), never a
+// panic from dereferencing a nil error slot.
+func TestRunConversationTransportFailureReturnsError(t *testing.T) {
+	t.Helper()
+	scr := newScripted()
+	scr.transportErr = true
+	sess := scr.session()
+	r, w := io.Pipe()
+	defer r.Close()
+	defer w.Close()
+
+	var out bytes.Buffer
+	done := make(chan *terminal.Result, 1)
+	errs := make(chan error, 1)
+	go func() {
+		res, err := RunConversation(context.Background(), sess, "core", r, &out)
+		if err != nil {
+			errs <- err
+			return
+		}
+		done <- res
+	}()
+
+	if _, err := w.Write([]byte("hi\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// Wait until session.create + interaction have been attempted, i.e. the
+	// transport failure fired and cancelled the terminal conversation.
+	_ = drainWritten(t, scr, 2)
+
+	select {
+	case err := <-errs:
+		if !strings.Contains(fmt.Sprintf("%v", err), "transport") {
+			t.Fatalf("error = %v, want the transport failure", err)
+		}
+	case res := <-done:
+		t.Fatalf("transport failure produced no error (EndedBy=%q)", res.EndedBy)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the transport-failure error")
+	}
+}
+
+// Regression: awaitReply must require correlation_id == msgID, so an
+// unsolicited event with an absent correlation id is ignored rather than
+// mistaken for the Doll's reply.
+func TestSendLineIgnoresUncorrelatedEvent(t *testing.T) {
+	t.Helper()
+	scr := newScripted()
+	scr.unsolicited = true
+	reply, kind, err := SendLine(context.Background(), scr.session(), "sess-1", "core", "hi")
+	if err != nil {
+		t.Fatalf("SendLine err: %v", err)
+	}
+	if kind != ErrNone {
+		t.Fatalf("kind = %q, want none", kind)
+	}
+	if reply != "echo: hi" {
+		t.Fatalf("reply = %q, want %q (unsolicited empty-correlation event must be ignored)", reply, "echo: hi")
 	}
 }

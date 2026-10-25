@@ -151,7 +151,11 @@ func RunConversation(ctx context.Context, that Session, dollID string, in io.Rea
 	}
 
 	childCtx, childCancel := context.WithCancel(ctx)
-	var fatal *error
+	// fatalSlot owns the transport-failure storage that the per-line closure
+	// writes through fatal. It is read only after Run returns, so it stays
+	// within RunConversation's frame for the whole synchronous Run.
+	var fatalSlot error
+	var fatal *error = &fatalSlot
 
 	fn := func(line string, n int) string {
 		reply, kind, err := SendLine(ctx, that, sid, dollID, line)
@@ -169,7 +173,7 @@ func RunConversation(ctx context.Context, that Session, dollID string, in io.Rea
 
 	tm := terminal.New(in, out, fn)
 	res, rerr := tm.Run(childCtx)
-	if fatal != nil {
+	if *fatal != nil {
 		return res, *fatal
 	}
 	if rerr != nil {
@@ -196,8 +200,12 @@ func awaitReply(ctx context.Context, that Session, msgID string) (string, SendEr
 		switch fr.Kind {
 		case "event":
 			e := fr.Event
-			if e.CorrelationID != "" && e.CorrelationID != msgID {
-				continue // another correlation's event (unexpected in a serial conversation)
+			// Require the event to be the response correlated with this send.
+			// Events with a different or absent correlation_id (unsolicited
+			// pushes, another session's events) are not this reply and are
+			// skipped rather than mistaken for the Doll's response.
+			if e.CorrelationID != msgID {
+				continue
 			}
 			switch e.Type {
 			case "message":
