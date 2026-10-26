@@ -235,6 +235,11 @@ type chat struct {
 const (
 	reconnectInitialDelay = 500 * time.Millisecond
 	reconnectMaxDelay     = 30 * time.Second
+	// closeAfterDisconnectDeadline is the overall time budget for the
+	// disconnected-EOF cleanup attempt. If Core stays unreachable beyond
+	// this deadline, the cleanup returns an explicit error identifying the
+	// session that could not be closed.
+	closeAfterDisconnectDeadline = 5 * time.Second
 )
 
 // nextDelay reproduces body's nextBackoff: double the delay, saturating at max
@@ -467,7 +472,8 @@ func RunConversation(ctx context.Context, dialer Dialer, dollID string, in io.Re
 			// properly rather than silently leaving it open. If reconnect
 			// fails permanently, return an explicit error indicating the
 			// session remains open on Core.
-			if cerr := closeSessionAfterDisconnect(ctx, c.dialer, c.sid, c.reconnect, c.maxReconnect); cerr != nil {
+			deadline := time.Now().Add(closeAfterDisconnectDeadline)
+			if cerr := closeSessionAfterDisconnect(ctx, c.dialer, c.sid, c.reconnect, c.maxReconnect, deadline); cerr != nil {
 				return res, fmt.Errorf("body: interaction: session %q still active on Core (clean close failed): %w", c.sid, cerr)
 			}
 		}
@@ -593,17 +599,32 @@ func decodeInbound(msg []byte) inbound {
 // closeSessionAfterDisconnect attempts to close a Core Interaction Session
 // after a transport disconnect caused the conversation to end with EOF while
 // disconnected. It performs a bounded reconnect with fresh authentication and
-// retries transient transport failures, but fails closed on explicit Core
-// rejections (session_unavailable, closed, revoked) or permanent
-// authentication failures. Returns nil if the session was closed successfully,
-// or an error if the session remains active on Core.
-func closeSessionAfterDisconnect(ctx context.Context, dialer Dialer, sessionID string, initialBackoff, maxBackoff time.Duration) error {
+// retries transient transport failures up to the given deadline, but fails
+// closed on explicit Core rejections (session_unavailable, closed, revoked) or
+// permanent authentication failures. Returns nil if the session was closed
+// successfully, or an error if the session remains active on Core or the
+// deadline was exceeded.
+func closeSessionAfterDisconnect(ctx context.Context, dialer Dialer, sessionID string, initialBackoff, maxBackoff time.Duration, deadline time.Time) error {
+	// Create a context that respects both the original context and our deadline
+	var dialCtx context.Context
+	var cancel context.CancelFunc
+	if !deadline.IsZero() {
+		dialCtx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+	} else {
+		dialCtx = ctx
+	}
+
 	backoff := initialBackoff
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		sess, err := dialer(ctx)
+		// Check overall deadline
+		if !deadline.IsZero() && time.Now().After(deadline) {
+			return fmt.Errorf("body: interaction: close session deadline exceeded (session %q still active on Core)", sessionID)
+		}
+		sess, err := dialer(dialCtx)
 		if err != nil {
 			if body.IsPermanent(err) {
 				return fmt.Errorf("body: interaction: permanent dial failure while closing session: %w", err)

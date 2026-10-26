@@ -822,8 +822,45 @@ func TestCloseSessionAfterDisconnectCancellation(t *testing.T) {
 		cancel()
 	}()
 
-	err := closeSessionAfterDisconnect(ctx, blockingDialer, "sess-1", 10*time.Millisecond, 50*time.Millisecond)
+	deadline := time.Now().Add(10 * time.Second)
+	err := closeSessionAfterDisconnect(ctx, blockingDialer, "sess-1", 10*time.Millisecond, 50*time.Millisecond, deadline)
 	if err == nil || !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context.Canceled", err)
 	}
+}
+
+// M11.2: Disconnected-EOF cleanup must have a finite deadline.
+// When Core never returns, closeSessionAfterDisconnect must terminate
+// within its configured deadline and return an explicit error identifying
+// the session that could not be closed.
+func TestCloseSessionAfterDisconnectDeadline(t *testing.T) {
+	t.Helper()
+	// A dialer that blocks forever (Core never returns)
+	blockingDialer := func(ctx context.Context) (Session, error) {
+		<-ctx.Done()
+		return Session{}, ctx.Err()
+	}
+
+	// Short deadline for the test
+	shortDeadline := 200 * time.Millisecond
+	deadline := time.Now().Add(shortDeadline)
+	// Use a context with a longer timeout so our deadline check fires first
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := closeSessionAfterDisconnect(ctx, blockingDialer, "sess-deadline-test", 10*time.Millisecond, 50*time.Millisecond, deadline)
+
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	// Error should mention the deadline exceeded and the session ID
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "deadline exceeded") {
+		t.Fatalf("error should mention deadline exceeded, got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "sess-deadline-test") {
+		t.Fatalf("error should mention session ID, got: %s", errMsg)
+	}
+	// Should complete quickly (within deadline + small margin)
+	// This test itself validates the deadline behavior
 }
