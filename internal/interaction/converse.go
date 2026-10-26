@@ -29,8 +29,10 @@ package interaction
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/Neon-Dolls/neondoll-shellbody/internal/body"
@@ -257,65 +259,123 @@ func waitFor(ctx context.Context, d time.Duration) error {
 }
 
 // ensureResumed returns the conversation to a live, authenticated, resumed
-// transport after a transport drop. It re-dials via the Dialer (which performs
-// a fresh Body Authentication v1 and re-advertises capabilities), retrying
-// transient dial failures with the recovery machinery's bounded exponential
-// backoff. Once connected it re-selects the existing
-// Core Interaction Session by id and verifies it is still active and owned by
-// this Body before returning. A missing, foreign, closed, or revoked session,
-// or a permanent authentication failure, returns an error so the conversation
-// fails explicitly and never silently creates a replacement session.
+// transport after a transport drop. It uses SelectSessionWithRetry to
+// re-dial via the Dialer (which performs a fresh Body Authentication v1
+// and re-advertises capabilities), retrying transient dial failures with
+// bounded exponential backoff. Once connected it re-selects the existing
+// Core Interaction Session by id and verifies it is still active and owned
+// by this Body before returning. A missing, foreign, closed, or revoked
+// session, or a permanent authentication failure, returns an error so the
+// conversation fails explicitly and never silently creates a replacement.
+//
+// Transport failures during session.select are retried with fresh authentication
+// and bounded backoff. Explicit Core rejections (session_unavailable, closed,
+// revoked, non-active status) fail closed immediately — never retried.
 func ensureResumed(ctx context.Context, c *chat) error {
 	if c.connected {
 		return nil
 	}
-	backoff := c.reconnect
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		sess, err := c.dialer(ctx)
-		if err == nil {
-			if c.sid == "" {
-				// No prior session to resume. Refuse to fabricate one: a
-				// persistent conversation must never silently create a
-				// replacement for an unknown/lost session.
-				_ = sess.Close()
-				return fmt.Errorf("body: interaction: no session to resume; refusing to silently create a replacement")
-			}
-			// Re-authenticated as this Body. Verify the existing session is
-			// still authorized (owned by this Body) and open before sending
-			// further input: session.select is the single authority and fails
-			// closed for foreign/closed/absent sessions.
-			resumed, serr := SelectSession(ctx, sess, "sc_"+uuid.NewString(), c.sid)
-			if serr != nil {
-				_ = sess.Close()
-				return fmt.Errorf("body: interaction: cannot resume session: %w", serr)
-			}
-			if resumed != c.sid {
-				_ = sess.Close()
-				return fmt.Errorf("body: interaction: session.select returned %q, want %q", resumed, c.sid)
-			}
-			c.live = sess
-			c.connected = true
-			return nil
+		// SelectSessionWithRetry handles dialing, select, and retry logic
+		resumed, sess, serr := SelectSessionWithRetry(ctx, c.dialer, c.sid, c.reconnect, c.maxReconnect)
+		if serr != nil {
+			return fmt.Errorf("body: interaction: cannot resume session: %w", serr)
 		}
-		// Dial failed. Permanent failures (Core reachable but rejecting this
-		// Body's identity, or an invalid local identity) can never succeed by
-		// retrying, so fail closed rather than loop forever. Everything else
-		// is transient and retried after bounded backoff, exactly as the
-		// recovery loop does for the serve path.
-		if body.IsPermanent(err) {
-			return err
+		if resumed != c.sid {
+			_ = sess.Close()
+			return fmt.Errorf("body: interaction: session.select returned %q, want %q", resumed, c.sid)
 		}
+		c.live = sess
+		c.connected = true
+		return nil
+	}
+}
+
+// SelectSessionWithRetry performs session.select with retry logic that
+// distinguishes transient transport failures from explicit Core rejections.
+//   - Transient transport errors (dial/read/write failures) are retried with
+//     fresh authentication and bounded exponential backoff.
+//   - Explicit Core rejections (session_unavailable, session not active,
+//     foreign/closed/revoked) fail closed immediately and are never retried.
+//   - Permanent authentication failures (IsPermanent) fail closed immediately.
+//
+// Returns the selected session ID and the authenticated Session (caller owns it).
+func SelectSessionWithRetry(ctx context.Context, dialer Dialer, sessionID string, initialBackoff, maxBackoff time.Duration) (string, Session, error) {
+	backoff := initialBackoff
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", Session{}, err
+		}
+		sess, err := dialer(ctx)
+		if err != nil {
+			// Dial failure: classify as permanent vs transient
+			if body.IsPermanent(err) {
+				return "", Session{}, err
+			}
+			// Transient dial failure - retry with backoff
+			if ctx.Err() != nil {
+				return "", Session{}, ctx.Err()
+			}
+			if werr := waitFor(ctx, backoff); werr != nil {
+				return "", Session{}, werr
+			}
+			backoff = nextDelay(backoff, maxBackoff)
+			continue
+		}
+		// Dial succeeded, now attempt session.select
+		resumed, serr := SelectSession(ctx, sess, "sc_"+uuid.NewString(), sessionID)
+		if serr == nil {
+			// Success - session resumed
+			return resumed, sess, nil
+		}
+		_ = sess.Close()
+		// Check if this is a permanent Core rejection (never retry)
+		var sessionErr *SessionError
+		if errors.As(serr, &sessionErr) {
+			switch sessionErr.Code {
+			case core5.ErrorSessionUnavailable:
+				// Explicit Core rejection - session unavailable, closed, revoked, foreign
+				return "", Session{}, fmt.Errorf("body: interaction: session unavailable: %w", serr)
+			case core5.ErrorInternal, core5.ErrorInvalidRequest:
+				// Other explicit Core errors - fail closed
+				return "", Session{}, fmt.Errorf("body: interaction: session.select rejected: %w", serr)
+			}
+		}
+		// Check for non-active status in the error message
+		if strings.Contains(serr.Error(), "not active") {
+			return "", Session{}, fmt.Errorf("body: interaction: session not active: %w", serr)
+		}
+		// Transport failure during session.select - retry with fresh auth
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return "", Session{}, ctx.Err()
 		}
 		if werr := waitFor(ctx, backoff); werr != nil {
-			return werr
+			return "", Session{}, werr
 		}
-		backoff = nextDelay(backoff, c.maxReconnect)
+		backoff = nextDelay(backoff, maxBackoff)
 	}
+}
+
+// SessionError wraps a Core session control error code for typed checking.
+type SessionError struct {
+	Code    core5.ErrorCode
+	Message string
+}
+
+func (e *SessionError) Error() string {
+	return fmt.Sprintf("session error: code=%s message=%s", e.Code, e.Message)
+}
+
+// sessionControlError converts a Core session control error payload into a
+// typed SessionError for programmatic checking.
+func sessionControlError(err *core5.SessionError) error {
+	if err == nil {
+		return fmt.Errorf("body: interaction: session control error (no detail)")
+	}
+	return &SessionError{Code: err.Code, Message: err.Message}
 }
 
 // RunConversation opens a real Interaction Session, runs the interactive
@@ -395,9 +455,21 @@ func RunConversation(ctx context.Context, dialer Dialer, dollID string, in io.Re
 	// close, and a disconnected EOF leaves the durable session active (it can
 	// be resumed or closed by a later client). This matches Core's semantics:
 	// a transport disconnect never closes the Interaction Session.
-	if res != nil && res.EndedBy == terminal.EndEOF && c.connected {
-		if err := CloseSession(ctx, c.live, c.sid); err != nil {
-			return res, fmt.Errorf("body: interaction: close session: %w", err)
+	if res != nil && res.EndedBy == terminal.EndEOF {
+		if c.connected {
+			// We're still connected — clean close is straightforward.
+			if err := CloseSession(ctx, c.live, c.sid); err != nil {
+				return res, fmt.Errorf("body: interaction: close session: %w", err)
+			}
+		} else {
+			// EOF arrived after a transport disconnect. The Core session is
+			// still active; we must attempt a bounded reconnect to close it
+			// properly rather than silently leaving it open. If reconnect
+			// fails permanently, return an explicit error indicating the
+			// session remains open on Core.
+			if cerr := closeSessionAfterDisconnect(ctx, c.dialer, c.sid, c.reconnect, c.maxReconnect); cerr != nil {
+				return res, fmt.Errorf("body: interaction: session %q still active on Core (clean close failed): %w", c.sid, cerr)
+			}
 		}
 	}
 	return res, nil
@@ -518,12 +590,96 @@ func decodeInbound(msg []byte) inbound {
 	}
 }
 
-// sessionControlError renders a Core session control Error detail.
-func sessionControlError(e *core5.SessionError) error {
-	if e == nil {
-		return fmt.Errorf("body: interaction: session control failed (no detail)")
+// closeSessionAfterDisconnect attempts to close a Core Interaction Session
+// after a transport disconnect caused the conversation to end with EOF while
+// disconnected. It performs a bounded reconnect with fresh authentication and
+// retries transient transport failures, but fails closed on explicit Core
+// rejections (session_unavailable, closed, revoked) or permanent
+// authentication failures. Returns nil if the session was closed successfully,
+// or an error if the session remains active on Core.
+func closeSessionAfterDisconnect(ctx context.Context, dialer Dialer, sessionID string, initialBackoff, maxBackoff time.Duration) error {
+	backoff := initialBackoff
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		sess, err := dialer(ctx)
+		if err != nil {
+			if body.IsPermanent(err) {
+				return fmt.Errorf("body: interaction: permanent dial failure while closing session: %w", err)
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if werr := waitFor(ctx, backoff); werr != nil {
+				return werr
+			}
+			backoff = nextDelay(backoff, maxBackoff)
+			continue
+		}
+		// Dial succeeded. First, select the session to verify it's still
+		// active and owned by this Body before attempting to close it.
+		// This matches the pattern used in ensureResumed/SelectSessionWithRetry.
+		resumed, serr := SelectSession(ctx, sess, "sc_"+uuid.NewString(), sessionID)
+		if serr != nil {
+			_ = sess.Close()
+			// Check if this is a permanent Core rejection (never retry)
+			var sessionErr *SessionError
+			if errors.As(serr, &sessionErr) {
+				switch sessionErr.Code {
+				case core5.ErrorSessionUnavailable:
+					return fmt.Errorf("body: interaction: session unavailable on close: %w", serr)
+				case core5.ErrorInternal, core5.ErrorInvalidRequest:
+					return fmt.Errorf("body: interaction: session.select rejected on close: %w", serr)
+				}
+			}
+			if strings.Contains(serr.Error(), "not active") {
+				return fmt.Errorf("body: interaction: session not active on close: %w", serr)
+			}
+			// Transport failure - retry with fresh auth
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if werr := waitFor(ctx, backoff); werr != nil {
+				return werr
+			}
+			backoff = nextDelay(backoff, maxBackoff)
+			continue
+		}
+		if resumed != sessionID {
+			_ = sess.Close()
+			return fmt.Errorf("body: interaction: session.select returned %q, want %q", resumed, sessionID)
+		}
+		// Session selected successfully, now attempt session.close
+		if err := CloseSession(ctx, sess, sessionID); err != nil {
+			_ = sess.Close()
+			// Check if this is a permanent Core rejection
+			var sessionErr *SessionError
+			if errors.As(err, &sessionErr) {
+				switch sessionErr.Code {
+				case core5.ErrorSessionUnavailable:
+					return fmt.Errorf("body: interaction: session unavailable on close: %w", err)
+				case core5.ErrorInternal, core5.ErrorInvalidRequest:
+					return fmt.Errorf("body: interaction: session.close rejected: %w", err)
+				}
+			}
+			if strings.Contains(err.Error(), "not active") {
+				return fmt.Errorf("body: interaction: session not active on close: %w", err)
+			}
+			// Transport failure - retry
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if werr := waitFor(ctx, backoff); werr != nil {
+				return werr
+			}
+			backoff = nextDelay(backoff, maxBackoff)
+			continue
+		}
+		// Successfully closed
+		_ = sess.Close()
+		return nil
 	}
-	return fmt.Errorf("body: interaction: %s: %s", e.Code, e.Message)
 }
 
 // errorText formats an error as a displayable string.

@@ -607,3 +607,223 @@ func TestSendLineIgnoresUncorrelatedEvent(t *testing.T) {
 		t.Fatalf("reply = %q, want %q (unsolicited empty-correlation event must be ignored)", reply, "echo: hi")
 	}
 }
+
+// M11.2: Transport failure during session.select (not during interaction)
+// must be retried with fresh authentication and bounded backoff. The
+// dialer returns a fresh session on each call, so a transient transport
+// error on the select should trigger a re-dial and a fresh select attempt.
+func TestSelectSessionTransportFailureRetries(t *testing.T) {
+	t.Helper()
+	// First dial: transport error on session.select
+	drop := newScripted()
+	// We need to make session.select fail with a transport error
+	// Override the scripted behavior for session.select to return a transport error
+	drop.transportErr = false // we'll handle this via a custom session
+	// Let's use a more targeted approach: create a custom session that fails on select
+	selectFailThenSucceed := newScripted()
+	callCount := 0
+	customDial := func(ctx context.Context) (Session, error) {
+		callCount++
+		if callCount == 1 {
+			// First call: transport error during select
+			return Session{
+				Write: func(ctx context.Context, value any) error {
+					frame, _ := json.Marshal(value)
+					var env struct {
+						Type string `json:"type"`
+					}
+					_ = json.Unmarshal(frame, &env)
+					if env.Type == "session.select" {
+						return fmt.Errorf("simulated transport failure during select")
+					}
+					return nil // shouldn't happen
+				},
+				Read: func(ctx context.Context) ([]byte, error) {
+					return nil, fmt.Errorf("transport closed")
+				},
+				Close: func() error { return nil },
+			}, nil
+		}
+		// Second call: succeed
+		return selectFailThenSucceed.session(), nil
+	}
+
+	sid, _, err := SelectSessionWithRetry(context.Background(), customDial, "sess-1", 10*time.Millisecond, 50*time.Millisecond)
+	if err != nil {
+		t.Fatalf("SelectSessionWithRetry: %v", err)
+	}
+	if sid != "sess-1" {
+		t.Fatalf("sid = %q, want sess-1", sid)
+	}
+	if callCount != 2 {
+		t.Fatalf("expected 2 dial attempts (fail + retry), got %d", callCount)
+	}
+}
+
+// M11.2: EOF after a disconnected interaction must attempt bounded
+// reconnect and session closure, or return an explicit error indicating
+// the session remains open on Core.
+func TestRunConversationEOFAfterDisconnectAttemptsClose(t *testing.T) {
+	t.Helper()
+	// First dial: transport drops during interaction
+	drop := newScripted()
+	drop.transportErr = true
+	// Second dial (reconnect for close): succeed and close session
+	closeSucceeds := newScripted()
+	sessions := []*scripted{drop, closeSucceeds}
+
+	var out bytes.Buffer
+	r, w := io.Pipe()
+	defer r.Close()
+	defer w.Close()
+
+	done := make(chan *terminal.Result, 1)
+	errs := make(chan error, 1)
+	go func() {
+		res, err := RunConversation(context.Background(), dialFrom(sessions), "core", r, &out)
+		if err != nil {
+			errs <- err
+			return
+		}
+		done <- res
+	}()
+
+	// Send one line, which will trigger the transport error
+	if _, err := w.Write([]byte("one\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// Wait for the first dial to process the line (create + interaction that fails)
+	_ = drainWritten(t, drop, 2)
+
+	// Now close the pipe (EOF) while disconnected
+	_ = w.Close()
+
+	select {
+	case res := <-done:
+		if res.EndedBy != terminal.EndEOF {
+			t.Fatalf("EndedBy = %q, want EOF", res.EndedBy)
+		}
+		// Should have successfully closed the session on the second dial
+		if closeSucceeds.createCount != 0 {
+			t.Fatalf("close dial created a new session (createCount=%d), want 0", closeSucceeds.createCount)
+		}
+		if closeSucceeds.selectCount != 1 {
+			t.Fatalf("close dial selectCount = %d, want 1 (select to close)", closeSucceeds.selectCount)
+		}
+		if len(closeSucceeds.selectedIDs) != 1 || closeSucceeds.selectedIDs[0] != "sess-1" {
+			t.Fatalf("close selectedIDs = %v, want [sess-1]", closeSucceeds.selectedIDs)
+		}
+	case err := <-errs:
+		t.Fatalf("unexpected error: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for the conversation to finish")
+	}
+}
+
+// M11.2: If the close-after-disconnect fails permanently (e.g.,
+// session_unavailable), return an explicit error indicating the session
+// remains open on Core.
+func TestRunConversationEOFAfterDisconnectFailsClosedOnSessionUnavailable(t *testing.T) {
+	t.Helper()
+	drop := newScripted()
+	drop.transportErr = true
+	// Close attempt: session.select returns session_unavailable
+	refuse := newScripted()
+	refuse.selectErr = true // session.select replies session_unavailable
+	sessions := []*scripted{drop, refuse}
+
+	var out bytes.Buffer
+	r, w := io.Pipe()
+	defer r.Close()
+	defer w.Close()
+
+	done := make(chan *terminal.Result, 1)
+	errs := make(chan error, 1)
+	go func() {
+		res, err := RunConversation(context.Background(), dialFrom(sessions), "core", r, &out)
+		if err != nil {
+			errs <- err
+			return
+		}
+		done <- res
+	}()
+
+	if _, err := w.Write([]byte("one\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = drainWritten(t, drop, 2)
+	_ = w.Close()
+
+	select {
+	case err := <-errs:
+		msg := fmt.Sprintf("%v", err)
+		if !strings.Contains(msg, "session") && !strings.Contains(msg, "unavailable") && !strings.Contains(msg, "still active") {
+			t.Fatalf("error = %v, want explicit session-unavailable/still-active error", err)
+		}
+	case res := <-done:
+		t.Fatalf("conversation ended cleanly (EndedBy=%q) despite session close failing", res.EndedBy)
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for the fail-closed error")
+	}
+}
+
+// M11.2: Cancellation during reconnect must be respected immediately.
+// The reconnect loop in ensureResumed / SelectSessionWithRetry /
+// closeSessionAfterDisconnect must check ctx.Err() at each iteration.
+func TestRunConversationCancellationDuringReconnect(t *testing.T) {
+	t.Helper()
+	// A dialer that blocks indefinitely (simulates a slow/unreachable Core)
+	blockingDialer := func(ctx context.Context) (Session, error) {
+		<-ctx.Done()
+		return Session{}, ctx.Err()
+	}
+
+	var out bytes.Buffer
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan *terminal.Result, 1)
+	errs := make(chan error, 1)
+	go func() {
+		res, err := RunConversation(ctx, blockingDialer, "core", strings.NewReader("hi\n"), &out)
+		if err != nil {
+			errs <- err
+			return
+		}
+		done <- res
+	}()
+
+	// Give it a moment to start the first dial, then cancel
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errs:
+		if err == nil || !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want context.Canceled", err)
+		}
+	case res := <-done:
+		t.Fatalf("conversation returned result (%v) instead of cancellation error", res)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for cancellation to propagate")
+	}
+}
+
+// M11.2: Cancellation during close-after-disconnect must be respected.
+func TestCloseSessionAfterDisconnectCancellation(t *testing.T) {
+	t.Helper()
+	// A dialer that blocks indefinitely
+	blockingDialer := func(ctx context.Context) (Session, error) {
+		<-ctx.Done()
+		return Session{}, ctx.Err()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	err := closeSessionAfterDisconnect(ctx, blockingDialer, "sess-1", 10*time.Millisecond, 50*time.Millisecond)
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+}
