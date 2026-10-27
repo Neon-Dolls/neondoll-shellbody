@@ -604,35 +604,52 @@ func decodeInbound(msg []byte) inbound {
 // permanent authentication failures. Returns nil if the session was closed
 // successfully, or an error if the session remains active on Core or the
 // deadline was exceeded.
+//
+// The deadline applies end-to-end to all blocking operations: dialing,
+// session.select, session.close, and backoff waits. A single derived context
+// ensures the wall-clock budget governs the entire cleanup attempt.
 func closeSessionAfterDisconnect(ctx context.Context, dialer Dialer, sessionID string, initialBackoff, maxBackoff time.Duration, deadline time.Time) error {
-	// Create a context that respects both the original context and our deadline
-	var dialCtx context.Context
+	// Create a single deadline-aware context that governs ALL blocking
+	// operations in this cleanup attempt: dial, session.select, session.close,
+	// and backoff sleeps. This ensures the deadline applies end-to-end.
+	var closeCtx context.Context
 	var cancel context.CancelFunc
 	if !deadline.IsZero() {
-		dialCtx, cancel = context.WithDeadline(ctx, deadline)
+		closeCtx, cancel = context.WithDeadline(ctx, deadline)
 		defer cancel()
 	} else {
-		dialCtx = ctx
+		closeCtx = ctx
 	}
 
 	backoff := initialBackoff
 	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		// Check overall deadline
+		// Explicit deadline check for early exit with clear error message
+		// (covers the case where deadline is set but context hasn't fired yet,
+		// and ensures we return our custom error with session ID before
+		// closeCtx.Err() returns the raw "context deadline exceeded")
 		if !deadline.IsZero() && time.Now().After(deadline) {
 			return fmt.Errorf("body: interaction: close session deadline exceeded (session %q still active on Core)", sessionID)
 		}
-		sess, err := dialer(dialCtx)
+		if err := closeCtx.Err(); err != nil {
+			// If context is cancelled but our explicit deadline hasn't fired yet,
+			// it's an external cancellation - propagate it.
+			// If our deadline already fired, the check above would have caught it.
+			return err
+		}
+		sess, err := dialer(closeCtx)
 		if err != nil {
 			if body.IsPermanent(err) {
 				return fmt.Errorf("body: interaction: permanent dial failure while closing session: %w", err)
 			}
-			if ctx.Err() != nil {
-				return ctx.Err()
+			// Check deadline first - if our deadline fired during dial,
+			// return custom error with session ID rather than raw ctx.Err()
+			if !deadline.IsZero() && time.Now().After(deadline) {
+				return fmt.Errorf("body: interaction: close session deadline exceeded (session %q still active on Core)", sessionID)
 			}
-			if werr := waitFor(ctx, backoff); werr != nil {
+			if closeCtx.Err() != nil {
+				return closeCtx.Err()
+			}
+			if werr := waitFor(closeCtx, backoff); werr != nil {
 				return werr
 			}
 			backoff = nextDelay(backoff, maxBackoff)
@@ -641,7 +658,7 @@ func closeSessionAfterDisconnect(ctx context.Context, dialer Dialer, sessionID s
 		// Dial succeeded. First, select the session to verify it's still
 		// active and owned by this Body before attempting to close it.
 		// This matches the pattern used in ensureResumed/SelectSessionWithRetry.
-		resumed, serr := SelectSession(ctx, sess, "sc_"+uuid.NewString(), sessionID)
+		resumed, serr := SelectSession(closeCtx, sess, "sc_"+uuid.NewString(), sessionID)
 		if serr != nil {
 			_ = sess.Close()
 			// Check if this is a permanent Core rejection (never retry)
@@ -658,10 +675,14 @@ func closeSessionAfterDisconnect(ctx context.Context, dialer Dialer, sessionID s
 				return fmt.Errorf("body: interaction: session not active on close: %w", serr)
 			}
 			// Transport failure - retry with fresh auth
-			if ctx.Err() != nil {
-				return ctx.Err()
+			// Check deadline first - if our deadline fired, return custom error
+			if !deadline.IsZero() && time.Now().After(deadline) {
+				return fmt.Errorf("body: interaction: close session deadline exceeded (session %q still active on Core)", sessionID)
 			}
-			if werr := waitFor(ctx, backoff); werr != nil {
+			if closeCtx.Err() != nil {
+				return closeCtx.Err()
+			}
+			if werr := waitFor(closeCtx, backoff); werr != nil {
 				return werr
 			}
 			backoff = nextDelay(backoff, maxBackoff)
@@ -672,7 +693,7 @@ func closeSessionAfterDisconnect(ctx context.Context, dialer Dialer, sessionID s
 			return fmt.Errorf("body: interaction: session.select returned %q, want %q", resumed, sessionID)
 		}
 		// Session selected successfully, now attempt session.close
-		if err := CloseSession(ctx, sess, sessionID); err != nil {
+		if err := CloseSession(closeCtx, sess, sessionID); err != nil {
 			_ = sess.Close()
 			// Check if this is a permanent Core rejection
 			var sessionErr *SessionError
@@ -688,10 +709,14 @@ func closeSessionAfterDisconnect(ctx context.Context, dialer Dialer, sessionID s
 				return fmt.Errorf("body: interaction: session not active on close: %w", err)
 			}
 			// Transport failure - retry
-			if ctx.Err() != nil {
-				return ctx.Err()
+			// Check deadline first - if our deadline fired, return custom error
+			if !deadline.IsZero() && time.Now().After(deadline) {
+				return fmt.Errorf("body: interaction: close session deadline exceeded (session %q still active on Core)", sessionID)
 			}
-			if werr := waitFor(ctx, backoff); werr != nil {
+			if closeCtx.Err() != nil {
+				return closeCtx.Err()
+			}
+			if werr := waitFor(closeCtx, backoff); werr != nil {
 				return werr
 			}
 			backoff = nextDelay(backoff, maxBackoff)

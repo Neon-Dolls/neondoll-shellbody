@@ -864,3 +864,159 @@ func TestCloseSessionAfterDisconnectDeadline(t *testing.T) {
 	// Should complete quickly (within deadline + small margin)
 	// This test itself validates the deadline behavior
 }
+
+// M11.2: Regression test for deadline enforcement on session.select blocking.
+// If authentication succeeds but session.select never responds (hangs), the
+// cleanup must still respect the overall deadline and return an explicit
+// error identifying the session, rather than blocking indefinitely.
+func TestCloseSessionAfterDisconnectDeadlineOnSelect(t *testing.T) {
+	t.Helper()
+	// A dialer that succeeds (authentication works) but session.select blocks forever
+	selectBlocksDialer := func(ctx context.Context) (Session, error) {
+		return Session{
+			Write: func(ctx context.Context, value any) error {
+				frame, _ := json.Marshal(value)
+				var env struct {
+					Type string `json:"type"`
+				}
+				_ = json.Unmarshal(frame, &env)
+				if env.Type == "session.select" {
+					// Block forever on session.select - this simulates Core
+					// accepting the connection but never responding to select
+					<-ctx.Done()
+					return ctx.Err()
+				}
+				// Other operations (like session.close) should not be reached
+				// in this test, but we'll return an error if they are
+				return nil
+			},
+			Read: func(ctx context.Context) ([]byte, error) {
+				// For session.select, we never return a response - the Write
+				// call above blocks on context cancellation instead
+				<-ctx.Done()
+				return nil, ctx.Err()
+			},
+			Close: func() error { return nil },
+		}, nil
+	}
+
+	// Short deadline for the test
+	shortDeadline := 200 * time.Millisecond
+	deadline := time.Now().Add(shortDeadline)
+	// Use a context with a longer timeout so our deadline check fires first
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	err := closeSessionAfterDisconnect(ctx, selectBlocksDialer, "sess-select-deadline", 10*time.Millisecond, 50*time.Millisecond, deadline)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	// Error should mention the deadline exceeded and the session ID
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "deadline exceeded") {
+		t.Fatalf("error should mention deadline exceeded, got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "sess-select-deadline") {
+		t.Fatalf("error should mention session ID, got: %s", errMsg)
+	}
+	// Should complete within deadline + small margin (not hang forever)
+	if elapsed > 2*shortDeadline {
+		t.Fatalf("cleanup took %v, expected to respect deadline of %v", elapsed, shortDeadline)
+	}
+}
+
+// M11.2: Regression test for deadline enforcement on session.close blocking.
+// If session.select succeeds but session.close never responds (hangs), the
+// cleanup must still respect the overall deadline.
+func TestCloseSessionAfterDisconnectDeadlineOnClose(t *testing.T) {
+	t.Helper()
+	// Helper to extract correlation ID from a frame
+	getCorrelationID := func(frame []byte) string {
+		var env struct {
+			ID string `json:"id"`
+		}
+		_ = json.Unmarshal(frame, &env)
+		return env.ID
+	}
+
+	// A dialer that succeeds, session.select succeeds, but session.close blocks forever
+	closeBlocksDialer := func(ctx context.Context) (Session, error) {
+		var lastWriteType string
+		var selectFrame []byte
+		return Session{
+			Write: func(ctx context.Context, value any) error {
+				frame, _ := json.Marshal(value)
+				var env struct {
+					Type string `json:"type"`
+				}
+				_ = json.Unmarshal(frame, &env)
+				lastWriteType = env.Type
+				if env.Type == "session.select" {
+					selectFrame = frame
+				}
+				if env.Type == "session.close" {
+					// Block forever on session.close
+					<-ctx.Done()
+					return ctx.Err()
+				}
+				// session.select succeeds
+				return nil
+			},
+			Read: func(ctx context.Context) ([]byte, error) {
+				if lastWriteType == "session.select" {
+					// Return successful session.select response
+					resp := core5.SessionResponse{
+						Version:       core5.SessionControlVersion,
+						Type:          core5.TypeResult,
+						ID:            "core-1",
+						CorrelationID: getCorrelationID(selectFrame),
+						Payload: core5.SessionResponsePayload{
+							Operation: core5.TypeSelect,
+							Status:    core5.StatusOK,
+							Session: &core5.Session{
+								ID:        "sess-close-deadline",
+								Status:    "active",
+								CreatedAt: time.Now().UTC(),
+								UpdatedAt: time.Now().UTC(),
+							},
+						},
+					}
+					b, _ := json.Marshal(resp)
+					return b, nil
+				}
+				// For session.close we block in Write, so this shouldn't be reached
+				<-ctx.Done()
+				return nil, ctx.Err()
+			},
+			Close: func() error { return nil },
+		}, nil
+	}
+
+	// Short deadline for the test
+	shortDeadline := 200 * time.Millisecond
+	deadline := time.Now().Add(shortDeadline)
+	// Use a context with a longer timeout so our deadline check fires first
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	err := closeSessionAfterDisconnect(ctx, closeBlocksDialer, "sess-close-deadline", 10*time.Millisecond, 50*time.Millisecond, deadline)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "deadline exceeded") {
+		t.Fatalf("error should mention deadline exceeded, got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "sess-close-deadline") {
+		t.Fatalf("error should mention session ID, got: %s", errMsg)
+	}
+	if elapsed > 2*shortDeadline {
+		t.Fatalf("cleanup took %v, expected to respect deadline of %v", elapsed, shortDeadline)
+	}
+}
