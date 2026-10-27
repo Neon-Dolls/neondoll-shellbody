@@ -30,6 +30,7 @@ import (
 type scripted struct {
 	responses        chan []byte
 	written          chan []byte
+	writtenFrames    [][]byte
 	coreErr          bool     // interactions reply with a system error
 	doubleReply      bool     // interactions reply with a decoy then the real reply
 	createErr        bool     // session.create replies with a Core error
@@ -41,6 +42,7 @@ type scripted struct {
 	selectCount      int      // session.select frames written
 	selectedIDs      []string // session ids passed to session.select
 	interactionTexts []string // payload text of each interaction frame written
+	writeCount       int      // total frames written
 }
 
 func newScripted() *scripted {
@@ -60,6 +62,8 @@ func (s *scripted) session() Session {
 				return err
 			}
 			s.written <- frame
+			s.writeCount++
+			s.writtenFrames = append(s.writtenFrames, frame)
 			var env struct {
 				Type string `json:"type"`
 			}
@@ -347,7 +351,7 @@ func TestRunConversationEndToEnd(t *testing.T) {
 	ok := newScripted()
 	sessions := []*scripted{ok}
 	var out bytes.Buffer
-	res, err := RunConversation(context.Background(), dialFrom(sessions), "core", strings.NewReader("hi\nthere\n"), &out)
+	res, err := RunConversation(context.Background(), dialFrom(sessions), "core", strings.NewReader("hi\nthere\n"), &out, NopReporter{})
 	if err != nil {
 		t.Fatalf("RunConversation: %v", err)
 	}
@@ -387,7 +391,7 @@ func TestRunConversationCleanUpOnCancellation(t *testing.T) {
 	done := make(chan *terminal.Result, 1)
 	errs := make(chan error, 1)
 	go func() {
-		res, err := RunConversation(ctx, dialFrom(sessions), "core", r, &out)
+		res, err := RunConversation(ctx, dialFrom(sessions), "core", r, &out, NopReporter{})
 		if err != nil {
 			errs <- err
 			return
@@ -433,7 +437,7 @@ func TestRunConversationResumesSameSessionAcrossDrop(t *testing.T) {
 	done := make(chan *terminal.Result, 1)
 	errs := make(chan error, 1)
 	go func() {
-		res, err := RunConversation(context.Background(), dialFrom(sessions), "core", r, &out)
+		res, err := RunConversation(context.Background(), dialFrom(sessions), "core", r, &out, NopReporter{})
 		if err != nil {
 			errs <- err
 			return
@@ -514,7 +518,7 @@ func TestRunConversationFailsClosedWhenSessionUnavailable(t *testing.T) {
 	done := make(chan *terminal.Result, 1)
 	errs := make(chan error, 1)
 	go func() {
-		res, err := RunConversation(context.Background(), dialFrom(sessions), "core", r, &out)
+		res, err := RunConversation(context.Background(), dialFrom(sessions), "core", r, &out, NopReporter{})
 		if err != nil {
 			errs <- err
 			return
@@ -533,10 +537,7 @@ func TestRunConversationFailsClosedWhenSessionUnavailable(t *testing.T) {
 	select {
 	case err := <-errs:
 		msg := fmt.Sprintf("%v", err)
-		if !strings.Contains(msg, "cannot resume session") {
-			t.Fatalf("error = %v, want an explicit cannot-resume error", err)
-		}
-		if !strings.Contains(msg, "session_unavailable") {
+		if !strings.Contains(msg, "session unavailable") {
 			t.Fatalf("error = %v, want session_unavailable", err)
 		}
 	case res := <-done:
@@ -648,7 +649,7 @@ func TestSelectSessionTransportFailureRetries(t *testing.T) {
 		return selectFailThenSucceed.session(), nil
 	}
 
-	sid, _, err := SelectSessionWithRetry(context.Background(), customDial, "sess-1", 10*time.Millisecond, 50*time.Millisecond)
+	sid, _, err := SelectSessionWithRetry(context.Background(), customDial, "sess-1", 10*time.Millisecond, 50*time.Millisecond, NopReporter{})
 	if err != nil {
 		t.Fatalf("SelectSessionWithRetry: %v", err)
 	}
@@ -680,7 +681,7 @@ func TestRunConversationEOFAfterDisconnectAttemptsClose(t *testing.T) {
 	done := make(chan *terminal.Result, 1)
 	errs := make(chan error, 1)
 	go func() {
-		res, err := RunConversation(context.Background(), dialFrom(sessions), "core", r, &out)
+		res, err := RunConversation(context.Background(), dialFrom(sessions), "core", r, &out, NopReporter{})
 		if err != nil {
 			errs <- err
 			return
@@ -740,7 +741,7 @@ func TestRunConversationEOFAfterDisconnectFailsClosedOnSessionUnavailable(t *tes
 	done := make(chan *terminal.Result, 1)
 	errs := make(chan error, 1)
 	go func() {
-		res, err := RunConversation(context.Background(), dialFrom(sessions), "core", r, &out)
+		res, err := RunConversation(context.Background(), dialFrom(sessions), "core", r, &out, NopReporter{})
 		if err != nil {
 			errs <- err
 			return
@@ -783,7 +784,7 @@ func TestRunConversationCancellationDuringReconnect(t *testing.T) {
 	done := make(chan *terminal.Result, 1)
 	errs := make(chan error, 1)
 	go func() {
-		res, err := RunConversation(ctx, blockingDialer, "core", strings.NewReader("hi\n"), &out)
+		res, err := RunConversation(ctx, blockingDialer, "core", strings.NewReader("hi\n"), &out, NopReporter{})
 		if err != nil {
 			errs <- err
 			return
@@ -823,7 +824,7 @@ func TestCloseSessionAfterDisconnectCancellation(t *testing.T) {
 	}()
 
 	deadline := time.Now().Add(10 * time.Second)
-	err := closeSessionAfterDisconnect(ctx, blockingDialer, "sess-1", 10*time.Millisecond, 50*time.Millisecond, deadline)
+	err := closeSessionAfterDisconnect(ctx, blockingDialer, "sess-1", 10*time.Millisecond, 50*time.Millisecond, deadline, NopReporter{})
 	if err == nil || !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context.Canceled", err)
 	}
@@ -848,7 +849,7 @@ func TestCloseSessionAfterDisconnectDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	err := closeSessionAfterDisconnect(ctx, blockingDialer, "sess-deadline-test", 10*time.Millisecond, 50*time.Millisecond, deadline)
+	err := closeSessionAfterDisconnect(ctx, blockingDialer, "sess-deadline-test", 10*time.Millisecond, 50*time.Millisecond, deadline, NopReporter{})
 
 	if err == nil {
 		t.Fatal("expected error, got nil")
@@ -908,7 +909,7 @@ func TestCloseSessionAfterDisconnectDeadlineOnSelect(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	err := closeSessionAfterDisconnect(ctx, selectBlocksDialer, "sess-select-deadline", 10*time.Millisecond, 50*time.Millisecond, deadline)
+	err := closeSessionAfterDisconnect(ctx, selectBlocksDialer, "sess-select-deadline", 10*time.Millisecond, 50*time.Millisecond, deadline, NopReporter{})
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -1003,7 +1004,7 @@ func TestCloseSessionAfterDisconnectDeadlineOnClose(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	err := closeSessionAfterDisconnect(ctx, closeBlocksDialer, "sess-close-deadline", 10*time.Millisecond, 50*time.Millisecond, deadline)
+	err := closeSessionAfterDisconnect(ctx, closeBlocksDialer, "sess-close-deadline", 10*time.Millisecond, 50*time.Millisecond, deadline, NopReporter{})
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -1018,5 +1019,504 @@ func TestCloseSessionAfterDisconnectDeadlineOnClose(t *testing.T) {
 	}
 	if elapsed > 2*shortDeadline {
 		t.Fatalf("cleanup took %v, expected to respect deadline of %v", elapsed, shortDeadline)
+	}
+}
+
+// M11.3: StatusReporter receives connection status transitions in order.
+// Verifies connected -> disconnected -> reconnecting -> resumed flow.
+func TestStatusReporterTransitions(t *testing.T) {
+	t.Helper()
+
+	var statuses []string
+	reporter := StatusReporterFunc(func(s string) {
+		statuses = append(statuses, s)
+	})
+
+	// First dial: succeeds, then transport drops on interaction
+	drop := newScripted()
+	drop.transportErr = true
+	// Second dial: succeeds and resumes session
+	ok := newScripted()
+	sessions := []*scripted{drop, ok}
+
+	var out bytes.Buffer
+	r, w := io.Pipe()
+	defer r.Close()
+	defer w.Close()
+
+	done := make(chan *terminal.Result, 1)
+	errs := make(chan error, 1)
+	go func() {
+		res, err := RunConversation(context.Background(), dialFrom(sessions), "core", r, &out, reporter)
+		if err != nil {
+			errs <- err
+			return
+		}
+		done <- res
+	}()
+
+	// Send first line (triggers transport drop)
+	if _, err := w.Write([]byte("one\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = drainWritten(t, drop, 2) // create + interaction that fails
+
+	// Send second line (triggers reconnect and resume)
+	if _, err := w.Write([]byte("two\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = w.Close()
+
+	select {
+	case res := <-done:
+		if res.EndedBy != terminal.EndEOF {
+			t.Fatalf("EndedBy = %q, want EOF after resume", res.EndedBy)
+		}
+	case err := <-errs:
+		t.Fatalf("unexpected error: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the resumed conversation")
+	}
+
+	// Verify status sequence: connected -> disconnected -> reconnecting -> resumed
+	expected := []string{
+		"connected (session=sess-1)",
+		"disconnected",
+		"reconnecting...",
+		"resumed (session=sess-1)",
+	}
+	if len(statuses) < len(expected) {
+		t.Fatalf("expected at least %d status events, got %d: %v", len(expected), len(statuses), statuses)
+	}
+	for i, exp := range expected {
+		if i >= len(statuses) {
+			t.Fatalf("missing status event %d: expected %q", i, exp)
+		}
+		if !strings.Contains(statuses[i], exp) {
+			t.Fatalf("status[%d] = %q, expected to contain %q", i, statuses[i], exp)
+		}
+	}
+}
+
+// M11.3: StatusReporter receives permanent failure status on Core rejection.
+func TestStatusReporterPermanentFailure(t *testing.T) {
+	t.Helper()
+
+	var statuses []string
+	reporter := StatusReporterFunc(func(s string) {
+		statuses = append(statuses, s)
+	})
+
+	drop := newScripted()
+	drop.transportErr = true
+	refuse := newScripted()
+	refuse.selectErr = true // session_unavailable
+	sessions := []*scripted{drop, refuse}
+
+	var out bytes.Buffer
+	r, w := io.Pipe()
+	defer r.Close()
+	defer w.Close()
+
+	done := make(chan *terminal.Result, 1)
+	errs := make(chan error, 1)
+	go func() {
+		res, err := RunConversation(context.Background(), dialFrom(sessions), "core", r, &out, reporter)
+		if err != nil {
+			errs <- err
+			return
+		}
+		done <- res
+	}()
+
+	if _, err := w.Write([]byte("one\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = drainWritten(t, drop, 2)
+
+	if _, err := w.Write([]byte("two\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	select {
+	case err := <-errs:
+		msg := fmt.Sprintf("%v", err)
+		if !strings.Contains(msg, "session unavailable") {
+			t.Fatalf("error = %v, want session_unavailable", err)
+		}
+	case <-done:
+		t.Fatalf("conversation ended cleanly despite unavailable session")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out")
+	}
+
+	// Verify permanent failure status was emitted
+	foundPermanent := false
+	for _, s := range statuses {
+		if strings.Contains(s, "permanent failure") {
+			foundPermanent = true
+			break
+		}
+	}
+	if !foundPermanent {
+		t.Fatalf("expected permanent failure status, got: %v", statuses)
+	}
+}
+
+// M11.3: Interrupted interaction outcome is unknown — never silently resent.
+// The test verifies that after a transport drop during an interaction,
+// the original message is not resent on reconnect; instead the user
+// must explicitly send a new message.
+func TestInterruptedInteractionNeverResent(t *testing.T) {
+	t.Helper()
+
+	drop := newScripted()
+	drop.transportErr = true
+	ok := newScripted()
+	sessions := []*scripted{drop, ok}
+
+	var out bytes.Buffer
+	r, w := io.Pipe()
+	defer r.Close()
+	defer w.Close()
+
+	done := make(chan *terminal.Result, 1)
+	errs := make(chan error, 1)
+	go func() {
+		res, err := RunConversation(context.Background(), dialFrom(sessions), "core", r, &out, NopReporter{})
+		if err != nil {
+			errs <- err
+			return
+		}
+		done <- res
+	}()
+
+	// Send first line - this will hit the transport error
+	if _, err := w.Write([]byte("first message\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = drainWritten(t, drop, 2) // create + interaction (transport fails)
+
+	// The interaction was sent but outcome unknown. Now user sends a SECOND
+	// explicit message after reconnect - the first should NOT be resent.
+	if _, err := w.Write([]byte("second message\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = w.Close()
+
+	select {
+	case res := <-done:
+		if res.EndedBy != terminal.EndEOF {
+			t.Fatalf("EndedBy = %q, want EOF", res.EndedBy)
+		}
+	case err := <-errs:
+		t.Fatalf("unexpected error: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out")
+	}
+
+	// Verify: first dial saw exactly 2 writes (create + interaction that failed)
+	// Second dial should NOT see a resent first message - it should see select + second message
+	if drop.writeCount != 2 {
+		t.Fatalf("first dial writeCount = %d, want 2 (create + failed interaction)", drop.writeCount)
+	}
+
+	// The second dial (ok) should have: select + interaction for "second message"
+	// NOT a resent "first message"
+	foundFirst := false
+	foundSecond := false
+	for _, w := range ok.writtenFrames {
+		var env struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(w, &env)
+		if env.Type == "interaction" {
+			var msg struct {
+				Event struct {
+					Payload map[string]any `json:"payload"`
+				} `json:"event"`
+			}
+			_ = json.Unmarshal(w, &msg)
+			if text, ok := msg.Event.Payload["text"].(string); ok {
+				if strings.Contains(text, "first message") {
+					foundFirst = true
+				}
+				if strings.Contains(text, "second message") {
+					foundSecond = true
+				}
+			}
+		}
+	}
+	if foundFirst {
+		t.Fatalf("first message was silently resent on reconnect — must not happen")
+	}
+	if !foundSecond {
+		t.Fatalf("second message was not sent; expected interaction with 'second message'")
+	}
+}
+
+// M11.3: StatusReporter receives connection status transitions in order.
+// Verifies: connected -> disconnected -> reconnecting -> resumed -> (normal end)
+func TestRunConversationStatusTransitions(t *testing.T) {
+	t.Helper()
+	// First dial: transport drops during interaction
+	drop := newScripted()
+	drop.transportErr = true
+	// Second dial (reconnect): succeed and continue
+	ok := newScripted()
+	sessions := []*scripted{drop, ok}
+
+	var statusEvents []string
+	reporter := StatusReporterFunc(func(status string) {
+		statusEvents = append(statusEvents, status)
+	})
+
+	var out bytes.Buffer
+	r, w := io.Pipe()
+	defer r.Close()
+	defer w.Close()
+
+	done := make(chan *terminal.Result, 1)
+	errs := make(chan error, 1)
+	go func() {
+		res, err := RunConversation(context.Background(), dialFrom(sessions), "core", r, &out, reporter)
+		if err != nil {
+			errs <- err
+			return
+		}
+		done <- res
+	}()
+
+	// Send one line, which will trigger the transport error
+	if _, err := w.Write([]byte("first\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// Wait for the first dial to process the line (create + interaction that fails)
+	_ = drainWritten(t, drop, 2)
+
+	// Send second line on the resumed connection
+	if _, err := w.Write([]byte("second\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = w.Close()
+
+	select {
+	case res := <-done:
+		if res.EndedBy != terminal.EndEOF {
+			t.Fatalf("EndedBy = %q, want EOF", res.EndedBy)
+		}
+	case err := <-errs:
+		t.Fatalf("unexpected error: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for the conversation to finish")
+	}
+
+	// Verify status transition sequence
+	expected := []string{
+		"connected (session=sess-1)",
+		"disconnected",
+		"reconnecting...",
+		"resumed (session=sess-1)",
+	}
+	for i, exp := range expected {
+		if i >= len(statusEvents) {
+			t.Fatalf("statusEvents[%d] missing, expected %q, got %v", i, exp, statusEvents)
+		}
+		if statusEvents[i] != exp {
+			t.Fatalf("statusEvents[%d] = %q, want %q (full: %v)", i, statusEvents[i], exp, statusEvents)
+		}
+	}
+}
+
+// M11.3: Interrupted interaction outcome is unknown - never silently resent.
+// The first interaction fails transport; on reconnect, the human must send a
+// new message. The old message is never retransmitted automatically.
+func TestRunConversationInterruptedInteractionNeverResent(t *testing.T) {
+	t.Helper()
+	drop := newScripted()
+	drop.transportErr = true
+	ok := newScripted()
+	sessions := []*scripted{drop, ok}
+
+	var out bytes.Buffer
+	r, w := io.Pipe()
+	defer r.Close()
+	defer w.Close()
+
+	done := make(chan *terminal.Result, 1)
+	errs := make(chan error, 1)
+	go func() {
+		res, err := RunConversation(context.Background(), dialFrom(sessions), "core", r, &out, NopReporter{})
+		if err != nil {
+			errs <- err
+			return
+		}
+		done <- res
+	}()
+
+	// Send first line - this will fail transport
+	if _, err := w.Write([]byte("first message\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = drainWritten(t, drop, 2)
+
+	// Send second line on resumed connection
+	if _, err := w.Write([]byte("second message\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = w.Close()
+
+	select {
+	case res := <-done:
+		if res.EndedBy != terminal.EndEOF {
+			t.Fatalf("EndedBy = %q, want EOF", res.EndedBy)
+		}
+	case err := <-errs:
+		t.Fatalf("unexpected error: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out")
+	}
+
+	// Verify: first dial saw exactly 2 writes (create + interaction that failed)
+	if drop.writeCount != 2 {
+		t.Fatalf("first dial writeCount = %d, want 2 (create + failed interaction)", drop.writeCount)
+	}
+
+	// The second dial (ok) should have: select + interaction for "second message"
+	// NOT a resent "first message"
+	foundFirst := false
+	foundSecond := false
+	for _, w := range ok.writtenFrames {
+		var env struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(w, &env)
+		if env.Type == "interaction" {
+			var msg struct {
+				Event struct {
+					Payload map[string]any `json:"payload"`
+				} `json:"event"`
+			}
+			_ = json.Unmarshal(w, &msg)
+			if text, ok := msg.Event.Payload["text"].(string); ok {
+				if strings.Contains(text, "first message") {
+					foundFirst = true
+				}
+				if strings.Contains(text, "second message") {
+					foundSecond = true
+				}
+			}
+		}
+	}
+	if foundFirst {
+		t.Fatalf("first message was silently resent on reconnect — must not happen")
+	}
+	if !foundSecond {
+		t.Fatalf("second message was not sent; expected interaction with 'second message'")
+	}
+}
+
+// M11.3: Core rejection (explicit) vs unknown transport failure.
+// When Core explicitly rejects the session (session_unavailable), status is
+// permanent failure. When transport fails, status is reconnecting/resumed.
+func TestRunConversationCoreRejectionShowsPermanentFailure(t *testing.T) {
+	t.Helper()
+	drop := newScripted()
+	drop.transportErr = true
+	// Second dial: Core rejects with session_unavailable
+	refuse := newScripted()
+	refuse.selectErr = true
+	sessions := []*scripted{drop, refuse}
+
+	var statusEvents []string
+	reporter := StatusReporterFunc(func(status string) {
+		statusEvents = append(statusEvents, status)
+	})
+
+	var out bytes.Buffer
+	r, w := io.Pipe()
+	defer r.Close()
+	defer w.Close()
+
+	done := make(chan *terminal.Result, 1)
+	errs := make(chan error, 1)
+	go func() {
+		res, err := RunConversation(context.Background(), dialFrom(sessions), "core", r, &out, reporter)
+		if err != nil {
+			errs <- err
+			return
+		}
+		done <- res
+	}()
+
+	if _, err := w.Write([]byte("one\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = drainWritten(t, drop, 2)
+
+	if _, err := w.Write([]byte("two\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	select {
+	case err := <-errs:
+		msg := fmt.Sprintf("%v", err)
+		if !strings.Contains(msg, "session unavailable") {
+			t.Fatalf("error = %v, want session_unavailable", err)
+		}
+	case <-done:
+		t.Fatalf("conversation ended cleanly despite an unavailable session")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out")
+	}
+
+	// Verify status transitions include permanent failure
+	foundPermanent := false
+	for _, s := range statusEvents {
+		if strings.Contains(s, "permanent failure") {
+			foundPermanent = true
+			break
+		}
+	}
+	if !foundPermanent {
+		t.Fatalf("expected permanent failure status, got %v", statusEvents)
+	}
+}
+
+// M11.3: Diagnostics go to stderr, Doll conversation to stdout.
+// Verify output separation.
+func TestRunConversationOutputSeparation(t *testing.T) {
+	t.Helper()
+	ok := newScripted()
+	sessions := []*scripted{ok}
+
+	var out bytes.Buffer
+	var errOut bytes.Buffer
+
+	reporter := StatusReporterFunc(func(status string) {
+		errOut.WriteString(status + "\n")
+	})
+
+	res, err := RunConversation(context.Background(), dialFrom(sessions), "core", strings.NewReader("hi\n"), &out, reporter)
+	if err != nil {
+		t.Fatalf("RunConversation: %v", err)
+	}
+	if res == nil {
+		t.Fatal("no result")
+	}
+
+	// stdout should only have Doll responses
+	stdout := out.String()
+	if !strings.Contains(stdout, "echo: hi") {
+		t.Fatalf("stdout missing Doll response, got: %q", stdout)
+	}
+	if strings.Contains(stdout, "connected") || strings.Contains(stdout, "disconnected") || strings.Contains(stdout, "reconnecting") || strings.Contains(stdout, "resumed") {
+		t.Fatalf("stdout contains diagnostics, got: %q", stdout)
+	}
+
+	// stderr (via reporter) should have diagnostics
+	stderr := errOut.String()
+	if !strings.Contains(stderr, "connected") {
+		t.Fatalf("stderr missing connected status, got: %q", stderr)
 	}
 }

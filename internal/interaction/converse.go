@@ -50,6 +50,49 @@ const (
 	ErrTransport SendErrorKind = "transport" // the connection failed; the conversation drops it and reconnects
 )
 
+// StatusReporter receives terminal connection status transitions.
+// All methods are called on the caller's goroutine; implementations must be
+// safe for concurrent use if shared. Methods must not block indefinitely.
+// Diagnostics go to stderr; Doll conversation goes to stdout.
+type StatusReporter interface {
+	// OnConnected is called when a fresh session is established.
+	OnConnected(sessionID string)
+	// OnDisconnected is called when the transport connection drops.
+	OnDisconnected()
+	// OnReconnecting is called when a reconnection attempt starts.
+	OnReconnecting()
+	// OnResumed is called when the existing session is successfully re-selected
+	// after a transport drop. The sessionID confirms continuity.
+	OnResumed(sessionID string)
+	// OnPermanentFailure is called when recovery is impossible (Core rejection
+	// or permanent auth failure). The conversation ends; no further attempts.
+	OnPermanentFailure(reason string)
+}
+
+// NopReporter discards all status events. Used when no reporter is provided.
+type NopReporter struct{}
+
+func (NopReporter) OnConnected(sessionID string)     {}
+func (NopReporter) OnDisconnected()                  {}
+func (NopReporter) OnReconnecting()                  {}
+func (NopReporter) OnResumed(sessionID string)       {}
+func (NopReporter) OnPermanentFailure(reason string) {}
+
+// StatusReporterFunc adapts a function to the StatusReporter interface.
+type StatusReporterFunc func(status string)
+
+func (f StatusReporterFunc) OnConnected(sessionID string) {
+	f(fmt.Sprintf("connected (session=%s)", sessionID))
+}
+func (f StatusReporterFunc) OnDisconnected() { f("disconnected") }
+func (f StatusReporterFunc) OnReconnecting() { f("reconnecting...") }
+func (f StatusReporterFunc) OnResumed(sessionID string) {
+	f(fmt.Sprintf("resumed (session=%s)", sessionID))
+}
+func (f StatusReporterFunc) OnPermanentFailure(reason string) {
+	f(fmt.Sprintf("permanent failure: %s", reason))
+}
+
 // Session is the minimal transport surface the conversation needs. It is
 // satisfied by an authenticated body.Core4Session and by test fakes.
 type Session struct {
@@ -276,27 +319,44 @@ func waitFor(ctx context.Context, d time.Duration) error {
 // Transport failures during session.select are retried with fresh authentication
 // and bounded backoff. Explicit Core rejections (session_unavailable, closed,
 // revoked, non-active status) fail closed immediately — never retried.
-func ensureResumed(ctx context.Context, c *chat) error {
+// SelectSessionWithRetry handles OnReconnecting and OnResumed.
+func ensureResumed(ctx context.Context, c *chat, reporter StatusReporter) error {
 	if c.connected {
 		return nil
 	}
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
+	// SelectSessionWithRetry handles dialing, select, and retry logic
+	// including OnReconnecting on each attempt and OnResumed on success.
+	resumed, sess, serr := SelectSessionWithRetry(ctx, c.dialer, c.sid, c.reconnect, c.maxReconnect, reporter)
+	if serr != nil {
+		// Classify the error: permanent Core rejection vs transport failure
+		var sessionErr *SessionError
+		if errors.As(serr, &sessionErr) {
+			switch sessionErr.Code {
+			case core5.ErrorSessionUnavailable:
+				// Explicit Core rejection - session unavailable, closed, revoked, foreign
+				reporter.OnPermanentFailure(fmt.Sprintf("session unavailable: %v", serr))
+				return fmt.Errorf("body: interaction: session unavailable: %w", serr)
+			case core5.ErrorInternal, core5.ErrorInvalidRequest:
+				// Other explicit Core errors - fail closed
+				reporter.OnPermanentFailure(fmt.Sprintf("session.select rejected: %v", serr))
+				return fmt.Errorf("body: interaction: session.select rejected: %w", serr)
+			}
 		}
-		// SelectSessionWithRetry handles dialing, select, and retry logic
-		resumed, sess, serr := SelectSessionWithRetry(ctx, c.dialer, c.sid, c.reconnect, c.maxReconnect)
-		if serr != nil {
-			return fmt.Errorf("body: interaction: cannot resume session: %w", serr)
+		// Check for non-active status in the error message
+		if strings.Contains(serr.Error(), "not active") {
+			reporter.OnPermanentFailure(fmt.Sprintf("session not active: %v", serr))
+			return fmt.Errorf("body: interaction: session not active: %w", serr)
 		}
-		if resumed != c.sid {
-			_ = sess.Close()
-			return fmt.Errorf("body: interaction: session.select returned %q, want %q", resumed, c.sid)
-		}
-		c.live = sess
-		c.connected = true
-		return nil
+		// Transport failure - will be retried by SelectSessionWithRetry
+		return fmt.Errorf("body: interaction: cannot resume session: %w", serr)
 	}
+	if resumed != c.sid {
+		_ = sess.Close()
+		return fmt.Errorf("body: interaction: session.select returned %q, want %q", resumed, c.sid)
+	}
+	c.live = sess
+	c.connected = true
+	return nil
 }
 
 // SelectSessionWithRetry performs session.select with retry logic that
@@ -307,17 +367,21 @@ func ensureResumed(ctx context.Context, c *chat) error {
 //     foreign/closed/revoked) fail closed immediately and are never retried.
 //   - Permanent authentication failures (IsPermanent) fail closed immediately.
 //
+// The reporter receives status transitions: OnReconnecting at each dial attempt,
+// OnResumed on success, and OnPermanentFailure on explicit Core rejection.
 // Returns the selected session ID and the authenticated Session (caller owns it).
-func SelectSessionWithRetry(ctx context.Context, dialer Dialer, sessionID string, initialBackoff, maxBackoff time.Duration) (string, Session, error) {
+func SelectSessionWithRetry(ctx context.Context, dialer Dialer, sessionID string, initialBackoff, maxBackoff time.Duration, reporter StatusReporter) (string, Session, error) {
 	backoff := initialBackoff
 	for {
 		if err := ctx.Err(); err != nil {
 			return "", Session{}, err
 		}
+		reporter.OnReconnecting()
 		sess, err := dialer(ctx)
 		if err != nil {
 			// Dial failure: classify as permanent vs transient
 			if body.IsPermanent(err) {
+				reporter.OnPermanentFailure(fmt.Sprintf("permanent auth failure: %v", err))
 				return "", Session{}, err
 			}
 			// Transient dial failure - retry with backoff
@@ -334,6 +398,7 @@ func SelectSessionWithRetry(ctx context.Context, dialer Dialer, sessionID string
 		resumed, serr := SelectSession(ctx, sess, "sc_"+uuid.NewString(), sessionID)
 		if serr == nil {
 			// Success - session resumed
+			reporter.OnResumed(resumed)
 			return resumed, sess, nil
 		}
 		_ = sess.Close()
@@ -343,14 +408,17 @@ func SelectSessionWithRetry(ctx context.Context, dialer Dialer, sessionID string
 			switch sessionErr.Code {
 			case core5.ErrorSessionUnavailable:
 				// Explicit Core rejection - session unavailable, closed, revoked, foreign
+				reporter.OnPermanentFailure(fmt.Sprintf("session unavailable: %v", serr))
 				return "", Session{}, fmt.Errorf("body: interaction: session unavailable: %w", serr)
 			case core5.ErrorInternal, core5.ErrorInvalidRequest:
 				// Other explicit Core errors - fail closed
+				reporter.OnPermanentFailure(fmt.Sprintf("session.select rejected: %v", serr))
 				return "", Session{}, fmt.Errorf("body: interaction: session.select rejected: %w", serr)
 			}
 		}
 		// Check for non-active status in the error message
 		if strings.Contains(serr.Error(), "not active") {
+			reporter.OnPermanentFailure(fmt.Sprintf("session not active: %v", serr))
 			return "", Session{}, fmt.Errorf("body: interaction: session not active: %w", serr)
 		}
 		// Transport failure during session.select - retry with fresh auth
@@ -391,7 +459,14 @@ func sessionControlError(err *core5.SessionError) error {
 // continues the same conversation. If the session is reported closed/revoked/
 // unavailable or a reconnect fails permanently, the conversation ends with an
 // explicit error and never creates a replacement session.
-func RunConversation(ctx context.Context, dialer Dialer, dollID string, in io.Reader, out io.Writer) (*terminal.Result, error) {
+//
+// A StatusReporter receives connection status transitions for UX display.
+// Diagnostics go to stderr; Doll conversation goes to stdout. Pass NopReporter
+// to silence status events.
+func RunConversation(ctx context.Context, dialer Dialer, dollID string, in io.Reader, out io.Writer, reporter StatusReporter) (*terminal.Result, error) {
+	if reporter == nil {
+		reporter = NopReporter{}
+	}
 	c := &chat{
 		dialer:       dialer,
 		dollID:       dollID,
@@ -415,6 +490,9 @@ func RunConversation(ctx context.Context, dialer Dialer, dollID string, in io.Re
 	c.connected = true
 	c.sid = sid
 
+	// Report initial connection with session ID
+	reporter.OnConnected(sid)
+
 	childCtx, childCancel := context.WithCancel(ctx)
 	// fatalSlot owns the error storage that the per-line closure writes
 	// through fatal. It is read only after Run returns, so it stays within
@@ -425,7 +503,7 @@ func RunConversation(ctx context.Context, dialer Dialer, dollID string, in io.Re
 	fn := func(line string, n int) string {
 		// A dropped conversation is reconnected and its session resumed before
 		// the next input is sent; a failure here is fatal (fail closed).
-		if rerr := ensureResumed(childCtx, c); rerr != nil {
+		if rerr := ensureResumed(childCtx, c, reporter); rerr != nil {
 			*fatal = rerr
 			childCancel()
 			return "! " + errorText(rerr)
@@ -441,6 +519,7 @@ func RunConversation(ctx context.Context, dialer Dialer, dollID string, in io.Re
 			// resumes the same session.
 			_ = c.live.Close()
 			c.connected = false
+			reporter.OnDisconnected()
 			return "! connection interrupted; outcome unknown — reconnect and re-send if it did not land"
 		default:
 			return reply
@@ -473,7 +552,7 @@ func RunConversation(ctx context.Context, dialer Dialer, dollID string, in io.Re
 			// fails permanently, return an explicit error indicating the
 			// session remains open on Core.
 			deadline := time.Now().Add(closeAfterDisconnectDeadline)
-			if cerr := closeSessionAfterDisconnect(ctx, c.dialer, c.sid, c.reconnect, c.maxReconnect, deadline); cerr != nil {
+			if cerr := closeSessionAfterDisconnect(ctx, c.dialer, c.sid, c.reconnect, c.maxReconnect, deadline, reporter); cerr != nil {
 				return res, fmt.Errorf("body: interaction: session %q still active on Core (clean close failed): %w", c.sid, cerr)
 			}
 		}
@@ -608,7 +687,11 @@ func decodeInbound(msg []byte) inbound {
 // The deadline applies end-to-end to all blocking operations: dialing,
 // session.select, session.close, and backoff waits. A single derived context
 // ensures the wall-clock budget governs the entire cleanup attempt.
-func closeSessionAfterDisconnect(ctx context.Context, dialer Dialer, sessionID string, initialBackoff, maxBackoff time.Duration, deadline time.Time) error {
+//
+// The reporter receives status transitions during cleanup: OnReconnecting at
+// each dial attempt, OnResumed on successful select, and OnPermanentFailure
+// on explicit Core rejection.
+func closeSessionAfterDisconnect(ctx context.Context, dialer Dialer, sessionID string, initialBackoff, maxBackoff time.Duration, deadline time.Time, reporter StatusReporter) error {
 	// Create a single deadline-aware context that governs ALL blocking
 	// operations in this cleanup attempt: dial, session.select, session.close,
 	// and backoff sleeps. This ensures the deadline applies end-to-end.
@@ -636,9 +719,11 @@ func closeSessionAfterDisconnect(ctx context.Context, dialer Dialer, sessionID s
 			// If our deadline already fired, the check above would have caught it.
 			return err
 		}
+		reporter.OnReconnecting()
 		sess, err := dialer(closeCtx)
 		if err != nil {
 			if body.IsPermanent(err) {
+				reporter.OnPermanentFailure(fmt.Sprintf("permanent dial failure while closing session: %v", err))
 				return fmt.Errorf("body: interaction: permanent dial failure while closing session: %w", err)
 			}
 			// Check deadline first - if our deadline fired during dial,
@@ -666,12 +751,15 @@ func closeSessionAfterDisconnect(ctx context.Context, dialer Dialer, sessionID s
 			if errors.As(serr, &sessionErr) {
 				switch sessionErr.Code {
 				case core5.ErrorSessionUnavailable:
+					reporter.OnPermanentFailure(fmt.Sprintf("session unavailable on close: %v", serr))
 					return fmt.Errorf("body: interaction: session unavailable on close: %w", serr)
 				case core5.ErrorInternal, core5.ErrorInvalidRequest:
+					reporter.OnPermanentFailure(fmt.Sprintf("session.select rejected on close: %v", serr))
 					return fmt.Errorf("body: interaction: session.select rejected on close: %w", serr)
 				}
 			}
 			if strings.Contains(serr.Error(), "not active") {
+				reporter.OnPermanentFailure(fmt.Sprintf("session not active on close: %v", serr))
 				return fmt.Errorf("body: interaction: session not active on close: %w", serr)
 			}
 			// Transport failure - retry with fresh auth
@@ -692,6 +780,7 @@ func closeSessionAfterDisconnect(ctx context.Context, dialer Dialer, sessionID s
 			_ = sess.Close()
 			return fmt.Errorf("body: interaction: session.select returned %q, want %q", resumed, sessionID)
 		}
+		reporter.OnResumed(resumed)
 		// Session selected successfully, now attempt session.close
 		if err := CloseSession(closeCtx, sess, sessionID); err != nil {
 			_ = sess.Close()
@@ -700,12 +789,15 @@ func closeSessionAfterDisconnect(ctx context.Context, dialer Dialer, sessionID s
 			if errors.As(err, &sessionErr) {
 				switch sessionErr.Code {
 				case core5.ErrorSessionUnavailable:
+					reporter.OnPermanentFailure(fmt.Sprintf("session unavailable on close: %v", err))
 					return fmt.Errorf("body: interaction: session unavailable on close: %w", err)
 				case core5.ErrorInternal, core5.ErrorInvalidRequest:
+					reporter.OnPermanentFailure(fmt.Sprintf("session.close rejected: %v", err))
 					return fmt.Errorf("body: interaction: session.close rejected: %w", err)
 				}
 			}
 			if strings.Contains(err.Error(), "not active") {
+				reporter.OnPermanentFailure(fmt.Sprintf("session not active on close: %v", err))
 				return fmt.Errorf("body: interaction: session not active on close: %w", err)
 			}
 			// Transport failure - retry
