@@ -283,7 +283,7 @@ func TestRecoveryReconnectsAfterSessionDrop(t *testing.T) {
 		URL:               wsURL,
 		Creds:             testRecoveryCreds(),
 		Adapter:           testRecoveryAdapter(),
-		Advertised:        execution.Advertised(),
+		Advertised:        execution.AdvertisedCore4(),
 		ReconnectDelay:    30 * time.Millisecond,
 		MaxReconnectDelay: 200 * time.Millisecond,
 		Jitter:            -1, // deterministic timing for the test
@@ -326,7 +326,7 @@ func TestRecoveryRecoversAfterCoreUnavailable(t *testing.T) {
 		URL:               wsURL,
 		Creds:             testRecoveryCreds(),
 		Adapter:           testRecoveryAdapter(),
-		Advertised:        execution.Advertised(),
+		Advertised:        execution.AdvertisedCore4(),
 		ReconnectDelay:    30 * time.Millisecond,
 		MaxReconnectDelay: 200 * time.Millisecond,
 		Jitter:            -1,
@@ -378,7 +378,7 @@ func TestRecoveryFailsClosedOnInvalidLocalIdentity(t *testing.T) {
 		URL:        wsURL,
 		Creds:      creds,
 		Adapter:    testRecoveryAdapter(),
-		Advertised: execution.Advertised(),
+		Advertised: execution.AdvertisedCore4(),
 		Jitter:     -1,
 	})
 	err, ok := recoveryResult(t, errCh, 2*time.Second)
@@ -407,7 +407,7 @@ func TestRecoveryFailsClosedOnRevokedProof(t *testing.T) {
 		URL:        wsURL,
 		Creds:      testRecoveryCreds(),
 		Adapter:    testRecoveryAdapter(),
-		Advertised: execution.Advertised(),
+		Advertised: execution.AdvertisedCore4(),
 		Jitter:     -1,
 	})
 	err, ok := recoveryResult(t, errCh, 3*time.Second)
@@ -439,7 +439,7 @@ func TestRecoveryCancellationInterruptsBackoff(t *testing.T) {
 		URL:               wsURL,
 		Creds:             testRecoveryCreds(),
 		Adapter:           testRecoveryAdapter(),
-		Advertised:        execution.Advertised(),
+		Advertised:        execution.AdvertisedCore4(),
 		ReconnectDelay:    30 * time.Second, // long window
 		MaxReconnectDelay: 30 * time.Second,
 		Jitter:            -1,
@@ -487,7 +487,7 @@ func TestRecoveryNoDuplicateSessionsOrLeaks(t *testing.T) {
 		URL:               wsURL,
 		Creds:             testRecoveryCreds(),
 		Adapter:           testRecoveryAdapter(),
-		Advertised:        execution.Advertised(),
+		Advertised:        execution.AdvertisedCore4(),
 		ReconnectDelay:    5 * time.Millisecond,
 		MaxReconnectDelay: 10 * time.Millisecond,
 		Jitter:            -1,

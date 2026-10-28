@@ -12,6 +12,7 @@ import (
 	"github.com/Neon-Dolls/neondoll-shellbody/internal/auth"
 	"github.com/Neon-Dolls/neondoll-shellbody/internal/execution"
 	"github.com/Neon-Dolls/neondoll-shellbody/internal/link/core4"
+	"github.com/Neon-Dolls/neondoll-shellbody/internal/link/core5"
 )
 
 // PermanentError marks a connection failure that retrying cannot fix: a Core
@@ -221,6 +222,165 @@ func waitBackoff(ctx context.Context, d time.Duration) error {
 // formed, so an invalid local identity fails closed before any connection is
 // attempted.
 func (c Credentials) validate() error {
+	if len(c.BodyID) == 0 {
+		return errors.New("BodyID must not be empty")
+	}
+	if len(c.CorePublicKey) != ed25519.PublicKeySize {
+		return fmt.Errorf("CorePublicKey has %d bytes, want %d", len(c.CorePublicKey), ed25519.PublicKeySize)
+	}
+	if len(c.PrivateKey) != ed25519.PrivateKeySize {
+		return fmt.Errorf("PrivateKey has %d bytes, want %d", len(c.PrivateKey), ed25519.PrivateKeySize)
+	}
+	return nil
+}
+
+// Core5Credentials carries the enrolled identity and the Core trust anchor required
+// to run Body Authentication v1 over the Doll Link WebSocket.
+type Core5Credentials struct {
+	// BodyID is the body id Core issued at enrollment completion.
+	BodyID string
+	// PrivateKey is the Body's enrolled Ed25519 identity key used to sign the
+	// body.auth.proof frame.
+	PrivateKey ed25519.PrivateKey
+	// CoreID is Core's public id presented in authentication frames.
+	CoreID string
+	// CorePublicKey is Core's Ed25519 public key, used to verify the
+	// body.auth.challenge and body.auth.accept signatures.
+	CorePublicKey ed25519.PublicKey
+}
+
+// Core5RecoveryConfig configures the persistent Core 5 connection recovery loop.
+type Core5RecoveryConfig struct {
+	// URL is Core's /ws endpoint.
+	URL string
+	// Creds is the enrolled Ed25519 identity and Core trust anchor. It is
+	// loaded once from durable state and preserved unchanged across every
+	// reconnect cycle.
+	Creds Core5Credentials
+	// Adapter handles inbound execution requests.
+	Adapter *execution.Core5Adapter
+	// Advertised lists the capabilities re-advertised on every fresh
+	// connection.
+	Advertised []core5.Capability
+	// OnAuthenticated, if non-nil, is invoked after Core accepts each fresh
+	// connection's authentication. It is optional and used for logging.
+	OnAuthenticated func(sessionID string)
+	// ReconnectDelay is the base exponential backoff delay (default 500ms).
+	ReconnectDelay time.Duration
+	// MaxReconnectDelay caps the exponential backoff (default 30s).
+	MaxReconnectDelay time.Duration
+	// Jitter is the maximum random extra added to each backoff delay (default
+	// 500ms). Set negative to disable jitter.
+	Jitter time.Duration
+}
+
+// RunCore5Recovery drives a single persistent Core 5 connection for the Body's
+// lifetime. It connects, performs fresh Body Authentication v1 and re-advertises
+// capabilities on every connection, then blocks in the authenticated execution
+// session until the connection drops. Transient failures (Core unreachable at
+// dial time, or an authenticated session dropping) trigger a reconnect after
+// bounded exponential backoff with jitter; context cancellation interrupts any
+// backoff immediately. Permanent failures (authentication rejection by a
+// reachable Core, or an invalid local identity) fail closed and return without
+// retrying. At most one session is ever active, and a finished session is
+// closed before a replacement is dialed.
+func RunCore5Recovery(ctx context.Context, cfg Core5RecoveryConfig) error {
+	// An invalid local identity can never become valid by retrying, so fail
+	// closed before attempting any connection.
+	if err := cfg.Creds.validate(); err != nil {
+		return &PermanentError{Op: "local-credentials", Err: err}
+	}
+	if cfg.Adapter == nil {
+		return &PermanentError{Op: "local-credentials", Err: errors.New("execution adapter must not be nil")}
+	}
+
+	base := cfg.ReconnectDelay
+	if base <= 0 {
+		base = defaultReconnectDelay
+	}
+	max := cfg.MaxReconnectDelay
+	if max <= 0 {
+		max = defaultMaxReconnectDelay
+	}
+	jitter := cfg.Jitter
+	switch {
+	case jitter < 0:
+		jitter = 0 // explicitly disabled
+	case jitter == 0:
+		jitter = defaultJitter
+	}
+
+	backoff := base
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		err := connectOnceCore5(ctx, cfg)
+		if err == nil {
+			return nil
+		}
+		if IsPermanent(err) {
+			// Fail closed: revoked/invalid identity will never succeed by
+			// retrying, so do not retry indefinitely.
+			return err
+		}
+		if ctx.Err() != nil {
+			return ctx.Err() // cancellation wins over any pending reconnect
+		}
+
+		// Transient failure: back off before trying again. Cancellation
+		// interrupts the sleep immediately, giving prompt shutdown.
+		if err := waitBackoff(ctx, jittered(backoff, jitter)); err != nil {
+			return err
+		}
+		backoff = nextBackoff(backoff, max)
+	}
+}
+
+// connectOnceCore5 performs one full Core 5 session: dial, authenticate (Body Auth
+// v1), advertise capabilities, then serve executions until the connection
+// drops. Authentication rejection by a reachable Core is surfaced as
+// *PermanentError; every other failure — dial failure (Core unavailable), a
+// post-authentication transport hiccup, or an authenticated session dropping —
+// is transient and retried by RunCore5Recovery.
+func connectOnceCore5(ctx context.Context, cfg Core5RecoveryConfig) error {
+	sess, err := DialCore5(cfg.URL, cfg.Creds, cfg.Adapter)
+	if err != nil {
+		// Dial failed: Core is unreachable or the wire request was refused.
+		// Transient — retry with backoff until Core comes back.
+		return err
+	}
+	// The session is always closed before RunCore5Recovery dials a replacement, so
+	// old connections never linger and at most one session is ever active.
+	defer func() { _ = sess.Close() }()
+
+	sessionID, err := sess.Authenticate(ctx)
+	if err != nil {
+		// We connected to Core but the handshake was rejected or abandoned:
+		// retrying the same identity cannot fix it, so fail closed.
+		return &PermanentError{Op: "authenticate", Err: err}
+	}
+	if cfg.OnAuthenticated != nil {
+		cfg.OnAuthenticated(sessionID)
+	}
+
+	// Every fresh connection re-advertises the Body's capabilities.
+	if err := sess.AdvertiseCapabilities(ctx, cfg.Advertised); err != nil {
+		// The connection was authenticated but capability advertisement failed;
+		// transient — the next attempt re-authenticates and re-advertises.
+		return fmt.Errorf("body: advertise capabilities: %w", err)
+	}
+
+	// Authenticated execution session; returns only when the connection closes
+	// (transient) or ctx is cancelled.
+	return sess.Serve(ctx)
+}
+
+// validate checks that the local enrolled identity and trust anchor are well
+// formed, so an invalid local identity fails closed before any connection is
+// attempted.
+func (c Core5Credentials) validate() error {
 	if len(c.BodyID) == 0 {
 		return errors.New("BodyID must not be empty")
 	}

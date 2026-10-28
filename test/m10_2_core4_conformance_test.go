@@ -377,7 +377,7 @@ func TestShellBodyAuthenticationAndProcessExecutionAgainstCore(t *testing.T) {
 		t.Fatalf("accept core_id = %q, want %q", accept.CoreID, fx.coreID)
 	}
 
-	if err := sess.AdvertiseCapabilities(ctx, exec4.Advertised()); err != nil {
+	if err := sess.AdvertiseCapabilities(ctx, exec4.AdvertisedCore4()); err != nil {
 		t.Fatalf("advertise capabilities: %v", err)
 	}
 
