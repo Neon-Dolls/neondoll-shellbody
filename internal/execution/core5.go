@@ -4,7 +4,6 @@ package execution
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -49,32 +48,101 @@ func (a *Core5Adapter) Handle(ctx context.Context, req *core5.ExecutionRequest) 
 		return result
 	}
 
+	// Strict argument validation - reject malformed arguments
 	command, code, ok := requiredString(req.Payload.Arguments["command"])
 	if !ok {
 		result.Payload.Status = core5.ExecutionStatusInvalid
 		result.Payload.Result = map[string]any{"error": fmt.Sprintf("invalid arguments: %v", code)}
 		return result
 	}
-	args := stringSlice(req.Payload.Arguments["args"])
-	env := stringSlice(req.Payload.Arguments["env"])
-	dir, _ := optionalString(req.Payload.Arguments["dir"])
-	stdin, _ := optionalString(req.Payload.Arguments["stdin"])
-	timeout := a.defaultTimeout
-	if ts, err := optionalFloat(req.Payload.Arguments["timeout_s"]); err == nil && ts > 0 {
-		timeout = time.Duration(ts * float64(time.Second))
+
+	// Validate args
+	argsRaw, ok := req.Payload.Arguments["args"]
+	if argsRaw != nil {
+		switch v := argsRaw.(type) {
+		case []string:
+			// valid
+		case []any:
+			for i, item := range v {
+				if _, ok := item.(string); !ok {
+					result.Payload.Status = core5.ExecutionStatusInvalid
+					result.Payload.Result = map[string]any{"error": fmt.Sprintf("invalid arguments: args[%d] must be string, got %T", i, item)}
+					return result
+				}
+			}
+		case string:
+			// will be split by Fields
+		default:
+			result.Payload.Status = core5.ExecutionStatusInvalid
+			result.Payload.Result = map[string]any{"error": fmt.Sprintf("invalid arguments: args must be []string, []any, or string, got %T", v)}
+			return result
+		}
+	}
+	args := stringSlice(argsRaw)
+
+	// Validate env
+	envRaw, ok := req.Payload.Arguments["env"]
+	if envRaw != nil {
+		switch v := envRaw.(type) {
+		case []string:
+			// valid
+		case []any:
+			for i, item := range v {
+				if _, ok := item.(string); !ok {
+					result.Payload.Status = core5.ExecutionStatusInvalid
+					result.Payload.Result = map[string]any{"error": fmt.Sprintf("invalid arguments: env[%d] must be string, got %T", i, item)}
+					return result
+				}
+			}
+		default:
+			result.Payload.Status = core5.ExecutionStatusInvalid
+			result.Payload.Result = map[string]any{"error": fmt.Sprintf("invalid arguments: env must be []string or []any, got %T", v)}
+			return result
+		}
+	}
+	env := stringSlice(envRaw)
+
+	// Validate dir
+	dir, err := optionalString(req.Payload.Arguments["dir"])
+	if err != nil {
+		result.Payload.Status = core5.ExecutionStatusInvalid
+		result.Payload.Result = map[string]any{"error": fmt.Sprintf("invalid arguments: %v", err)}
+		return result
 	}
 
-	exitCode, stdout, stderr, err := executeWithExecutor(ctx, a.executor, command, args, env, dir, stdin, timeout)
-	switch {
-	case err == nil:
+	// Validate stdin
+	stdin, err := optionalString(req.Payload.Arguments["stdin"])
+	if err != nil {
+		result.Payload.Status = core5.ExecutionStatusInvalid
+		result.Payload.Result = map[string]any{"error": fmt.Sprintf("invalid arguments: %v", err)}
+		return result
+	}
+
+	// Validate timeout_s
+	timeout := a.defaultTimeout
+	if ts, err := optionalFloat(req.Payload.Arguments["timeout_s"]); err != nil {
+		result.Payload.Status = core5.ExecutionStatusInvalid
+		result.Payload.Result = map[string]any{"error": fmt.Sprintf("invalid arguments: %v", err)}
+		return result
+	} else if ts > 0 {
+		timeout = time.Duration(ts * float64(time.Second))
+	} else if ts < 0 {
+		result.Payload.Status = core5.ExecutionStatusInvalid
+		result.Payload.Result = map[string]any{"error": "invalid arguments: timeout_s must be positive"}
+		return result
+	}
+
+	exitCode, stdout, stderr, outcome := executeWithExecutor(ctx, a.executor, command, args, env, dir, stdin, timeout)
+	switch outcome {
+	case OutcomeSuccess:
 		result.Payload.Status = core5.ExecutionStatusSuccess
-	case ctx.Err() != nil:
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			result.Payload.Status = core5.ExecutionStatusExpired
-		} else {
-			result.Payload.Status = core5.ExecutionStatusCancelled
-		}
-	default:
+	case OutcomeFailed:
+		result.Payload.Status = core5.ExecutionStatusFailed
+	case OutcomeExpired:
+		result.Payload.Status = core5.ExecutionStatusExpired
+	case OutcomeCancelled:
+		result.Payload.Status = core5.ExecutionStatusCancelled
+	case OutcomeError:
 		result.Payload.Status = core5.ExecutionStatusFailed
 	}
 	result.Payload.Result = map[string]any{

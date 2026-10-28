@@ -92,19 +92,32 @@ func optionalFloat(v any) (float64, error) {
 	}
 }
 
+// ExecutionOutcome classifies the result of an execution.
+type ExecutionOutcome int
+
+const (
+	OutcomeSuccess ExecutionOutcome = iota
+	OutcomeFailed                   // process exited non-zero
+	OutcomeExpired                  // executor timeout
+	OutcomeCancelled
+	OutcomeError // other error (binary not found, etc.)
+)
+
 // executeWithExecutor runs the process executor with proper context handling
-// and maps the result to exit code, stdout, stderr, error.
-func executeWithExecutor(ctx context.Context, executor *process.Executor, command string, args []string, env []string, dir string, stdin string, timeout time.Duration) (int, string, string, error) {
+// and maps the result to exit code, stdout, stderr, and outcome classification.
+func executeWithExecutor(ctx context.Context, executor *process.Executor, command string, args []string, env []string, dir string, stdin string, timeout time.Duration) (int, string, string, ExecutionOutcome) {
 	exitCode, stdout, stderr, err := executor.Execute(ctx, command, args, env, dir, stdin, timeout)
 	switch {
 	case err == nil:
-		return exitCode, stdout, stderr, nil
-	case ctx.Err() != nil:
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return -1, stdout, stderr, err
+		if exitCode == 0 {
+			return exitCode, stdout, stderr, OutcomeSuccess
 		}
-		return -1, stdout, stderr, err
+		return exitCode, stdout, stderr, OutcomeFailed
+	case errors.Is(err, context.DeadlineExceeded):
+		return -1, stdout, stderr, OutcomeExpired
+	case errors.Is(err, context.Canceled):
+		return -1, stdout, stderr, OutcomeCancelled
 	default:
-		return -1, stdout, stderr, err
+		return -1, stdout, stderr, OutcomeError
 	}
 }

@@ -4,7 +4,6 @@ package execution
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -64,17 +63,17 @@ func (a *Adapter) Handle(ctx context.Context, req *core4.ExecutionRequest) *core
 		timeout = time.Duration(ts * float64(time.Second))
 	}
 
-	exitCode, stdout, stderr, err := executeWithExecutor(ctx, a.executor, command, args, env, dir, stdin, timeout)
-	switch {
-	case err == nil:
+	exitCode, stdout, stderr, outcome := executeWithExecutor(ctx, a.executor, command, args, env, dir, stdin, timeout)
+	switch outcome {
+	case OutcomeSuccess:
 		result.Payload.Status = core4.StatusSuccess
-	case ctx.Err() != nil:
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			result.Payload.Status = core4.StatusExpired
-		} else {
-			result.Payload.Status = core4.StatusCancelled
-		}
-	default:
+	case OutcomeFailed:
+		result.Payload.Status = core4.StatusFailed
+	case OutcomeExpired:
+		result.Payload.Status = core4.StatusExpired
+	case OutcomeCancelled:
+		result.Payload.Status = core4.StatusCancelled
+	case OutcomeError:
 		result.Payload.Status = core4.StatusFailed
 	}
 	result.Payload.Result = map[string]any{
