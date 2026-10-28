@@ -201,13 +201,13 @@ func executionStatusValid(s ExecutionStatus) bool {
 
 // ExecutionRequest is the canonical execution.request envelope (Core → Body).
 type ExecutionRequest struct {
-	Type          string                   `json:"type"`
-	ID            string                   `json:"id"`
-	Timestamp     time.Time                `json:"timestamp"`
-	DollID        string                   `json:"doll_id,omitempty"`
-	BodyID        string                   `json:"body_id"`
-	CorrelationID string                   `json:"correlation_id,omitempty"`
-	Payload       ExecutionRequestPayload  `json:"payload"`
+	Type          string                  `json:"type"`
+	ID            string                  `json:"id"`
+	Timestamp     time.Time               `json:"timestamp"`
+	DollID        string                  `json:"doll_id,omitempty"`
+	BodyID        string                  `json:"body_id"`
+	CorrelationID string                  `json:"correlation_id,omitempty"`
+	Payload       ExecutionRequestPayload `json:"payload"`
 }
 
 // ExecutionRequestPayload carries the capability/operation to execute.
@@ -220,20 +220,20 @@ type ExecutionRequestPayload struct {
 
 // ExecutionResult is the canonical execution.result envelope (Body → Core).
 type ExecutionResult struct {
-	Type          string                    `json:"type"`
-	ID            string                    `json:"id"`
-	Timestamp     time.Time                 `json:"timestamp"`
-	DollID        string                    `json:"doll_id,omitempty"`
-	BodyID        string                    `json:"body_id"`
-	CorrelationID string                    `json:"correlation_id"`
-	Payload       ExecutionResultPayload    `json:"payload"`
+	Type          string                 `json:"type"`
+	ID            string                 `json:"id"`
+	Timestamp     time.Time              `json:"timestamp"`
+	DollID        string                 `json:"doll_id,omitempty"`
+	BodyID        string                 `json:"body_id"`
+	CorrelationID string                 `json:"correlation_id"`
+	Payload       ExecutionResultPayload `json:"payload"`
 }
 
 // ExecutionResultPayload carries the outcome.
 type ExecutionResultPayload struct {
-	ExecutionID string         `json:"execution_id"`
+	ExecutionID string          `json:"execution_id"`
 	Status      ExecutionStatus `json:"status"`
-	Result      map[string]any `json:"result,omitempty"`
+	Result      map[string]any  `json:"result,omitempty"`
 }
 
 // ---- Capabilities Advertisement (DollLink/Capabilities) ----
@@ -257,9 +257,9 @@ type CapabilitiesAdvertisement struct {
 
 // Envelope is the generic Doll Link message envelope for Core 5.
 type Envelope struct {
-	Type    MessageType `json:"type"`
-	ID      string      `json:"id,omitempty"`
-	BodyID  string      `json:"body_id,omitempty"`
+	Type    MessageType     `json:"type"`
+	ID      string          `json:"id,omitempty"`
+	BodyID  string          `json:"body_id,omitempty"`
 	Payload json.RawMessage `json:"payload,omitempty"`
 }
 

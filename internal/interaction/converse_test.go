@@ -945,10 +945,11 @@ func TestCloseSessionAfterDisconnectVerifiesSessionID(t *testing.T) {
 	mismatchedDialer := func(ctx context.Context) (Session, error) {
 		var selectRequestID string
 		var selectRequestIDMu sync.Mutex
+		var selectFrame []byte
 		var readCalls int
 		return Session{
 			Write: func(ctx context.Context, value any) error {
-				// Capture the session.select request ID
+				// Capture the session.select request frame
 				data, _ := json.Marshal(value)
 				var env struct {
 					Type string `json:"type"`
@@ -959,6 +960,7 @@ func TestCloseSessionAfterDisconnectVerifiesSessionID(t *testing.T) {
 				if env.Type == "session.select" {
 					selectRequestIDMu.Lock()
 					selectRequestID = env.ID
+					selectFrame = data
 					selectRequestIDMu.Unlock()
 				}
 				return nil
@@ -982,22 +984,32 @@ func TestCloseSessionAfterDisconnectVerifiesSessionID(t *testing.T) {
 
 				selectRequestIDMu.Lock()
 				corrID := selectRequestID
+				selectFrameCopy := selectFrame
 				selectRequestIDMu.Unlock()
 
 				t.Logf("Read called (call %d), returning response with corrID=%q", readCalls, corrID)
 
 				// Return a session.select result with a MISMATCHED session ID
 				// but matching correlation ID so SelectSession accepts it as the response
-				resp := map[string]any{
-					"type":             "session.result",
-					"id":               "resp-1",
-					"correlation_id":   corrID,
-					"payload": map[string]any{
-						"session_id": "sess-WRONG",
-						"status":     "ok",
+				// Use proper core5.SessionResponse struct to match expected wire format
+				resp := core5.SessionResponse{
+					Version:       core5.SessionControlVersion,
+					Type:          core5.TypeResult,
+					ID:            "resp-1",
+					CorrelationID: corrID,
+					Payload: core5.SessionResponsePayload{
+						Operation: core5.TypeSelect,
+						Status:    core5.StatusOK,
+						Session: &core5.Session{
+							ID:        "sess-WRONG",
+							Status:    "active",
+							CreatedAt: time.Now().UTC(),
+							UpdatedAt: time.Now().UTC(),
+						},
 					},
 				}
 				data, _ := json.Marshal(resp)
+				_ = selectFrameCopy // silence unused warning if any
 				return data, nil
 			},
 			Close: func() error { return nil },

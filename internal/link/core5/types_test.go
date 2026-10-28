@@ -178,8 +178,8 @@ func TestExecutionRequestShape(t *testing.T) {
 			Capability:  "process",
 			Operation:   "run",
 			Arguments: map[string]any{
-				"command":  "echo",
-				"args":     []string{"hello"},
+				"command":   "echo",
+				"args":      []string{"hello"},
 				"timeout_s": 30.0,
 			},
 		},

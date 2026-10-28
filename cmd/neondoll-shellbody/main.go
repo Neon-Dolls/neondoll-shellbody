@@ -105,11 +105,11 @@ func run(args []string) error {
 	case *enrollOwnerMode:
 		return enrollOwner(store, *coreURL, *coreID, *coreKey)
 	case *serveMode != "":
-			return serve(store, *serveMode)
+		return serve(store, *serveMode)
 	case *serveCore5Mode != "":
-			return serveCore5(store, *serveCore5Mode)
+		return serveCore5(store, *serveCore5Mode)
 	case *converseMode != "":
-			return converse(store, *converseMode, *dollID)
+		return converse(store, *converseMode, *dollID)
 	case *connectMode:
 		return connect(store)
 	default:

@@ -378,7 +378,7 @@ func TestRecoveryFailsClosedOnInvalidLocalIdentity(t *testing.T) {
 		URL:        wsURL,
 		Creds:      creds,
 		Adapter:    testRecoveryAdapter(),
-		Advertised:        execution.AdvertisedCore4(),
+		Advertised: execution.AdvertisedCore4(),
 		Jitter:     -1,
 	})
 	err, ok := recoveryResult(t, errCh, 2*time.Second)
@@ -407,7 +407,7 @@ func TestRecoveryFailsClosedOnRevokedProof(t *testing.T) {
 		URL:        wsURL,
 		Creds:      testRecoveryCreds(),
 		Adapter:    testRecoveryAdapter(),
-		Advertised:        execution.AdvertisedCore4(),
+		Advertised: execution.AdvertisedCore4(),
 		Jitter:     -1,
 	})
 	err, ok := recoveryResult(t, errCh, 3*time.Second)
