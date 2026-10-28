@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -925,6 +926,105 @@ func TestCloseSessionAfterDisconnectDeadlineOnSelect(t *testing.T) {
 	// Should complete within deadline + small margin (not hang forever)
 	if elapsed > 2*shortDeadline {
 		t.Fatalf("cleanup took %v, expected to respect deadline of %v", elapsed, shortDeadline)
+	}
+}
+
+// TestCloseSessionAfterDisconnectVerifiesSessionID is the M12.1 regression
+// test for the M11.3 session resume behavior. It ensures that when a transport
+// disconnect occurs and the conversation reconnects, session.select returns a
+// session ID that MUST exactly match the active session ID. A mismatched
+// session ID means the Core session state has diverged — the transport must
+// be closed, OnResumed must NEVER be emitted, and the conversation must
+// fail closed immediately. No replacement session is ever created.
+func TestCloseSessionAfterDisconnectVerifiesSessionID(t *testing.T) {
+	t.Helper()
+
+	// Dialer that returns a session where SelectSession yields a DIFFERENT session ID
+	// This simulates Core returning a mismatched session ID - the definitive
+	// signal that the Core session state has diverged from what the Body expects.
+	mismatchedDialer := func(ctx context.Context) (Session, error) {
+		var selectRequestID string
+		var selectRequestIDMu sync.Mutex
+		var readCalls int
+		return Session{
+			Write: func(ctx context.Context, value any) error {
+				// Capture the session.select request ID
+				data, _ := json.Marshal(value)
+				var env struct {
+					Type string `json:"type"`
+					ID   string `json:"id"`
+				}
+				_ = json.Unmarshal(data, &env)
+				// SessionRequest for session.select has Type == "session.select"
+				if env.Type == "session.select" {
+					selectRequestIDMu.Lock()
+					selectRequestID = env.ID
+					selectRequestIDMu.Unlock()
+				}
+				return nil
+			},
+			Read: func(ctx context.Context) ([]byte, error) {
+				readCalls++
+				// Wait briefly for the request ID to be captured, respecting context
+				for i := 0; i < 100; i++ {
+					selectRequestIDMu.Lock()
+					corrID := selectRequestID
+					selectRequestIDMu.Unlock()
+					if corrID != "" {
+						break
+					}
+					select {
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					case <-time.After(1 * time.Millisecond):
+					}
+				}
+
+				selectRequestIDMu.Lock()
+				corrID := selectRequestID
+				selectRequestIDMu.Unlock()
+
+				t.Logf("Read called (call %d), returning response with corrID=%q", readCalls, corrID)
+
+				// Return a session.select result with a MISMATCHED session ID
+				// but matching correlation ID so SelectSession accepts it as the response
+				resp := map[string]any{
+					"type":             "session.result",
+					"id":               "resp-1",
+					"correlation_id":   corrID,
+					"payload": map[string]any{
+						"session_id": "sess-WRONG",
+						"status":     "ok",
+					},
+				}
+				data, _ := json.Marshal(resp)
+				return data, nil
+			},
+			Close: func() error { return nil },
+		}, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	deadline := time.Now().Add(10 * time.Second)
+	err := closeSessionAfterDisconnect(ctx, mismatchedDialer, "sess-ORIGINAL", 10*time.Millisecond, 50*time.Millisecond, deadline)
+
+	// Must fail - mismatched session ID must close transport and fail closed
+	if err == nil {
+		t.Fatal("expected error for mismatched session ID, got nil")
+	}
+
+	errMsg := err.Error()
+	t.Logf("Got error: %s", errMsg)
+	// Should mention the session ID mismatch
+	if !strings.Contains(errMsg, "session.select returned") && !strings.Contains(errMsg, "mismatched") {
+		t.Fatalf("error should mention session ID mismatch, got: %s", errMsg)
+	}
+
+	// Should NOT be a deadline or cancellation error - it's a definitive Core rejection
+	if strings.Contains(errMsg, "deadline exceeded") || strings.Contains(errMsg, "context") {
+		t.Fatalf("mismatched session ID must fail closed immediately, not retry: %s", errMsg)
 	}
 }
 

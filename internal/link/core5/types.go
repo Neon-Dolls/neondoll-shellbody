@@ -14,7 +14,10 @@
 // integration suite.
 package core5
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // ---- SessionControl (DollLink/SessionControl) ----
 
@@ -158,23 +161,106 @@ func NewDollMessage(id, dollID, text string) Event {
 	}
 }
 
-// sessionControlTypeValid reports whether t is a Body-addressable session
-// control request.
-func sessionControlTypeValid(t string) bool {
-	switch t {
-	case "session.create", "session.list", "session.select", "session.close":
+// ---- Execution (DollLink/Execution) ----
+
+// Execution type discriminators.
+const (
+	TypeExecutionRequest = "execution.request"
+	TypeExecutionResult  = "execution.result"
+)
+
+// SendSender is the canonical sender discriminator.
+const (
+	SenderCore = "core"
+	SenderBody = "body"
+)
+
+// ExecutionStatus is the canonical execution status.
+type ExecutionStatus string
+
+// Canonical execution statuses. These match Core 5 exactly.
+const (
+	ExecutionStatusSuccess     ExecutionStatus = "success"
+	ExecutionStatusDenied      ExecutionStatus = "denied"
+	ExecutionStatusUnsupported ExecutionStatus = "unsupported"
+	ExecutionStatusInvalid     ExecutionStatus = "invalid"
+	ExecutionStatusUnavailable ExecutionStatus = "unavailable"
+	ExecutionStatusFailed      ExecutionStatus = "failed"
+	ExecutionStatusCancelled   ExecutionStatus = "cancelled"
+	ExecutionStatusExpired     ExecutionStatus = "expired"
+)
+
+func executionStatusValid(s ExecutionStatus) bool {
+	switch s {
+	case ExecutionStatusSuccess, ExecutionStatusDenied, ExecutionStatusUnsupported, ExecutionStatusInvalid,
+		ExecutionStatusUnavailable, ExecutionStatusFailed, ExecutionStatusCancelled, ExecutionStatusExpired:
 		return true
 	}
 	return false
 }
 
-// eventKindValid reports whether k is a known event kind.
-func eventKindValid(k string) bool {
-	switch k {
-	case "message", "command", "system", "presence":
-		return true
-	}
-	return false
+// ExecutionRequest is the canonical execution.request envelope (Core → Body).
+type ExecutionRequest struct {
+	Type          string                   `json:"type"`
+	ID            string                   `json:"id"`
+	Timestamp     time.Time                `json:"timestamp"`
+	DollID        string                   `json:"doll_id,omitempty"`
+	BodyID        string                   `json:"body_id"`
+	CorrelationID string                   `json:"correlation_id,omitempty"`
+	Payload       ExecutionRequestPayload  `json:"payload"`
+}
+
+// ExecutionRequestPayload carries the capability/operation to execute.
+type ExecutionRequestPayload struct {
+	ExecutionID string         `json:"execution_id"`
+	Capability  string         `json:"capability"`
+	Operation   string         `json:"operation"`
+	Arguments   map[string]any `json:"arguments"`
+}
+
+// ExecutionResult is the canonical execution.result envelope (Body → Core).
+type ExecutionResult struct {
+	Type          string                    `json:"type"`
+	ID            string                    `json:"id"`
+	Timestamp     time.Time                 `json:"timestamp"`
+	DollID        string                    `json:"doll_id,omitempty"`
+	BodyID        string                    `json:"body_id"`
+	CorrelationID string                    `json:"correlation_id"`
+	Payload       ExecutionResultPayload    `json:"payload"`
+}
+
+// ExecutionResultPayload carries the outcome.
+type ExecutionResultPayload struct {
+	ExecutionID string         `json:"execution_id"`
+	Status      ExecutionStatus `json:"status"`
+	Result      map[string]any `json:"result,omitempty"`
+}
+
+// ---- Capabilities Advertisement (DollLink/Capabilities) ----
+
+// TypeCapabilitiesAdvertisement is the canonical discriminator.
+const TypeCapabilitiesAdvertisement = "body.capabilities"
+
+// CapabilitiesPayload wraps the advertised capability list.
+type CapabilitiesPayload struct {
+	Capabilities []Capability `json:"capabilities"`
+}
+
+// CapabilitiesAdvertisement is the canonical body.capabilities envelope.
+type CapabilitiesAdvertisement struct {
+	Type      string              `json:"type"`
+	ID        string              `json:"id"`
+	Timestamp time.Time           `json:"timestamp,omitempty"`
+	BodyID    string              `json:"body_id"`
+	Payload   CapabilitiesPayload `json:"payload"`
+}
+
+// Envelope is the generic Doll Link message envelope for Core 5.
+type Envelope struct {
+	Type    MessageType `json:"type"`
+	ID      string      `json:"id,omitempty"`
+	BodyID  string      `json:"body_id,omitempty"`
+	Payload json.RawMessage `json:"payload,omitempty"`
 }
 
 // parseKind converts a string to a EventKind.
@@ -191,4 +277,32 @@ func parseKind(s string) EventKind {
 	default:
 		return "unknown"
 	}
+}
+
+// eventKindValid reports whether k is a known event kind.
+func eventKindValid(k string) bool {
+	switch k {
+	case "message", "command", "system", "presence":
+		return true
+	}
+	return false
+}
+
+// Capability represents an advertised Body capability.
+type Capability struct {
+	ID          string            `json:"id"`
+	Operations  []string          `json:"operations"`
+	Available   bool              `json:"available"`
+	Constraints map[string]string `json:"constraints,omitempty"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
+}
+
+// sessionControlTypeValid reports whether t is a Body-addressable session
+// control request.
+func sessionControlTypeValid(t string) bool {
+	switch t {
+	case "session.create", "session.list", "session.select", "session.close":
+		return true
+	}
+	return false
 }

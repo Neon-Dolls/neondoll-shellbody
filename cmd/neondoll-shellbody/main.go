@@ -60,6 +60,7 @@ func run(args []string) error {
 	enrollMode := fs.String("enroll", "", "enroll as a Body with a Core 4 instance by consuming an invitation JSON file (requires --core-url; Core identity is discovered via GET /v1/core/identity unless --core-id/--core-key are supplied)")
 	enrollOwnerMode := fs.Bool("enroll-owner", false, "run the owner-approved Core 4 enrollment ceremony: begin a body_request, print the approval code for `neondollctl body approve CODE`, poll until the owner's decision is recorded, and persist the receipt (requires --core-url; discovers Core identity unless --core-id/--core-key are supplied)")
 	serveMode := fs.String("serve", "", "run a Core 4 Doll Link execution session against a Core ws URL (e.g. ws://host:port/ws)")
+	serveCore5Mode := fs.String("serve-core5", "", "run a Core 5 Doll Link execution session against a Core ws URL (e.g. ws://host:port/ws)")
 	converseMode := fs.String("converse", "", "open a real Core 5 Interaction Session and run the terminal conversation against a Core ws URL (e.g. ws://host:port/ws)")
 	dollID := fs.String("doll", "core", "which Doll to address in --converse (default: core, the Core's local Doll)")
 
@@ -104,9 +105,11 @@ func run(args []string) error {
 	case *enrollOwnerMode:
 		return enrollOwner(store, *coreURL, *coreID, *coreKey)
 	case *serveMode != "":
-		return serve(store, *serveMode)
+			return serve(store, *serveMode)
+	case *serveCore5Mode != "":
+			return serveCore5(store, *serveCore5Mode)
 	case *converseMode != "":
-		return converse(store, *converseMode, *dollID)
+			return converse(store, *converseMode, *dollID)
 	case *connectMode:
 		return connect(store)
 	default:
@@ -590,7 +593,7 @@ func converse(store *body.Store, wsURL, doll string) error {
 	var dials int
 	dialer := func(dctx context.Context) (interaction.Session, error) {
 		dials++
-		fs, sessionID, derr := body.DialFrameSession(dctx, wsURL, creds, execution.Advertised())
+		fs, sessionID, derr := body.DialFrameSession(dctx, wsURL, creds, execution.AdvertisedCore4())
 		if derr != nil {
 			// Dial or auth failure: surfaced to RunConversation, which
 			// reuses the recovery loop's classification — retry transient
@@ -665,9 +668,64 @@ func serve(store *body.Store, wsURL string) error {
 		URL:        wsURL,
 		Creds:      creds,
 		Adapter:    adapter,
-		Advertised: execution.Advertised(),
+		Advertised: execution.AdvertisedCore4(),
 		OnAuthenticated: func(accept *auth.Accept) {
 			fmt.Printf("authenticated with Core as body_id=%s (session=%s)\n", record.BodyID, accept.SessionID)
+		},
+	})
+}
+
+// serveCore5 runs a canonical Core 5 Doll Link execution session: it connects to
+// Core's /ws endpoint, authenticates using Body Auth v1, advertises the Body's
+// capabilities, and serves inbound execution.request messages until the connection
+// or the process is stopped.
+func serveCore5(store *body.Store, wsURL string) error {
+	if wsURL == "" {
+		return errors.New("--serve-core5 requires a Core ws URL (e.g. ws://host:port/ws)")
+	}
+	enrStore := enrollment.NewStore(store.Dir())
+	record, err := enrStore.LoadRecord()
+	if err != nil {
+		if errors.Is(err, enrollment.ErrStateNotFound) {
+			return errors.New("not enrolled yet (run --enroll first)")
+		}
+		return err
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if record.CoreID == "" {
+		return errors.New("record has no core_id; re-run --enroll")
+	}
+	if record.CorePublicKey == "" {
+		return errors.New("record has no core_public_key trust anchor; re-run --enroll")
+	}
+	corePubRaw, err := enrollment.DecodeRawURL(record.CorePublicKey)
+	if err != nil {
+		return fmt.Errorf("record core_public_key is invalid: %w", err)
+	}
+	enrIdent, err := enrStore.LoadIdentity()
+	if err != nil {
+		return fmt.Errorf("load identity for authentication: %w", err)
+	}
+
+	adapter := execution.NewCore5(process.NewExecutor(), 30*time.Second)
+	creds := body.Core5Credentials{
+		BodyID:        record.BodyID,
+		PrivateKey:    enrIdent.PrivateKey(),
+		CoreID:        record.CoreID,
+		CorePublicKey: ed25519.PublicKey(corePubRaw),
+	}
+	// Persistent connection: an enrolled Body reconnects automatically after
+	// losing its Core connection, without re-enrollment or identity loss.
+	return body.RunCore5Recovery(ctx, body.Core5RecoveryConfig{
+		URL:        wsURL,
+		Creds:      creds,
+		Adapter:    adapter,
+		Advertised: execution.AdvertisedCore5(),
+		OnAuthenticated: func(sessionID string) {
+			fmt.Printf("authenticated with Core as body_id=%s (session=%s)\n", record.BodyID, sessionID)
 		},
 	})
 }

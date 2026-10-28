@@ -71,7 +71,7 @@ func (fx *core4Fixture) startRecovery(t *testing.T, creds body.Credentials, coun
 			URL:        fx.wsURL,
 			Creds:      creds,
 			Adapter:    exec4.New(process.NewExecutor(), 30*time.Second),
-			Advertised: exec4.Advertised(),
+			Advertised: exec4.AdvertisedCore4(),
 			OnAuthenticated: func(accept *auth.Accept) {
 				counter.add(accept.BodyID, accept.SessionID)
 			},
