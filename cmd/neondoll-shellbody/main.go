@@ -609,9 +609,16 @@ func converse(store *body.Store, wsURL, doll string) error {
 			Close: fs.Close,
 		}, nil
 	}
+
+	// StatusReporter writes connection diagnostics to stderr, keeping stdout
+	// clean for Doll conversation.
+	reporter := interaction.StatusReporterFunc(func(status string) {
+		fmt.Fprintln(os.Stderr, status)
+	})
+
 	fmt.Fprintln(os.Stdout, "type and press Enter to talk to your Doll; Ctrl-D / Ctrl-C to close")
 
-	res, rerr := interaction.RunConversation(ctx, dialer, doll, os.Stdin, os.Stdout)
+	res, rerr := interaction.RunConversation(ctx, dialer, doll, os.Stdin, os.Stdout, reporter)
 	if rerr == nil && res != nil {
 		fmt.Fprintf(os.Stderr, "conversation ended (%s, %d line(s))\n", res.EndedBy, res.LinesIn)
 	}
