@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -46,6 +47,186 @@ func mustNonceForCore5(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return s
+}
+
+// TestExecutionResultSerialization verifies that execution.result frames
+// are properly serialized without double-marshaling. It decodes the actual
+// WebSocket frame and validates the canonical ExecutionResult structure.
+func TestExecutionResultSerialization(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Generate keys
+	corePub, corePriv, _ := ed25519.GenerateKey(rand.Reader)
+	_, bodyPriv, _ := ed25519.GenerateKey(rand.Reader)
+
+	bodyID := "test-body-" + uuid.NewString()
+	coreID := "test-core"
+
+	executor := process.NewExecutor()
+	adapter := execution.NewCore5(executor, 30*time.Second)
+
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := testUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		// Read hello
+		_, _, err = conn.ReadMessage()
+		if err != nil {
+			return
+		}
+
+		// Send challenge
+		challenge := auth.Challenge{
+			Version:   auth.Version,
+			Type:      auth.TypeChallenge,
+			CoreID:    coreID,
+			BodyID:    bodyID,
+			SessionID: "test-session",
+			BodyNonce: mustNonceForCore5(t),
+			CoreNonce: mustNonceForCore5(t),
+			ExpiresAt: time.Now().Add(30 * time.Second),
+			Algorithm: auth.AlgorithmEd25519,
+		}
+		_ = auth.SignChallenge(corePriv, &challenge)
+		_ = conn.WriteJSON(challenge)
+
+		// Read proof
+		_, _, err = conn.ReadMessage()
+		if err != nil {
+			return
+		}
+
+		// Send accept
+		accept := auth.Accept{
+			Version:   auth.Version,
+			Type:      auth.TypeAccept,
+			CoreID:    coreID,
+			BodyID:    bodyID,
+			SessionID: "test-session",
+			Status:    auth.StatusAuthenticated,
+		}
+		_ = auth.SignAccept(corePriv, &accept)
+		_ = conn.WriteJSON(accept)
+
+		// Read caps
+		_, _, err = conn.ReadMessage()
+		if err != nil {
+			return
+		}
+
+		// Send execution request
+		req := core5.ExecutionRequest{
+			Type:      core5.TypeExecutionRequest,
+			ID:        "exec-test",
+			Timestamp: time.Now().UTC(),
+			DollID:    "doll",
+			BodyID:    bodyID,
+			Payload: core5.ExecutionRequestPayload{
+				Capability:  "process",
+				Operation:   "run",
+				ExecutionID: uuid.NewString(),
+				Arguments:   map[string]any{"command": "echo", "args": []string{"hello"}},
+			},
+		}
+		_ = conn.WriteJSON(req)
+
+		// Read the result frame and verify it's properly structured
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+
+		var result core5.ExecutionResult
+		if err := json.Unmarshal(data, &result); err != nil {
+			t.Errorf("Failed to unmarshal execution.result: %v", err)
+			return
+		}
+
+		// Validate canonical structure
+		if result.Type != core5.TypeExecutionResult {
+			t.Errorf("Expected Type=%q, got %q", core5.TypeExecutionResult, result.Type)
+		}
+		if result.CorrelationID != req.ID {
+			t.Errorf("Expected CorrelationID=%q, got %q", req.ID, result.CorrelationID)
+		}
+		if result.Payload.ExecutionID != req.Payload.ExecutionID {
+			t.Errorf("Expected ExecutionID=%q, got %q", req.Payload.ExecutionID, result.Payload.ExecutionID)
+		}
+		if result.Payload.Status != core5.ExecutionStatusSuccess {
+			t.Errorf("Expected Status=ExecutionStatusSuccess, got %v", result.Payload.Status)
+		}
+		// Verify result payload has exit_code, stdout, stderr
+		if result.Payload.Result == nil {
+			t.Error("Expected Result payload to be non-nil")
+		} else {
+			resultMap := result.Payload.Result
+			if _, ok := resultMap["exit_code"]; !ok {
+				t.Error("Expected exit_code in Result")
+			}
+			if _, ok := resultMap["stdout"]; !ok {
+				t.Error("Expected stdout in Result")
+			}
+			if _, ok := resultMap["stderr"]; !ok {
+				t.Error("Expected stderr in Result")
+			}
+			if resultMap["exit_code"] != float64(0) {
+				t.Errorf("Expected exit_code 0, got %v", resultMap["exit_code"])
+			}
+			if resultMap["stdout"] != "hello\n" {
+				t.Errorf("Expected stdout 'hello\\n', got %q", resultMap["stdout"])
+			}
+		}
+	}))
+	defer testServer.Close()
+
+	wsURL := "ws" + testServer.URL[len("http"):] + "/ws"
+
+	creds := Core5Credentials{
+		BodyID:        bodyID,
+		PrivateKey:    bodyPriv,
+		CoreID:        coreID,
+		CorePublicKey: corePub,
+	}
+
+	session, err := DialCore5(wsURL, creds, adapter)
+	if err != nil {
+		t.Fatalf("DialCore5 failed: %v", err)
+	}
+
+	sessionID, err := session.Authenticate(ctx)
+	if err != nil {
+		t.Fatalf("Authenticate failed: %v", err)
+	}
+	if sessionID == "" {
+		t.Fatal("empty session ID")
+	}
+
+	// Advertise capabilities
+	caps := execution.AdvertisedCore5()
+	if err := session.AdvertiseCapabilities(ctx, caps); err != nil {
+		t.Fatalf("AdvertiseCapabilities failed: %v", err)
+	}
+
+	// Serve and wait for completion
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- session.Serve(ctx)
+	}()
+
+	select {
+	case err := <-serveErr:
+		if err != nil && err != context.Canceled {
+			t.Logf("serve ended: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not complete")
+	}
+
+	_ = session.Close()
 }
 
 func TestCore5SessionHandlesDisconnectDuringExecution(t *testing.T) {

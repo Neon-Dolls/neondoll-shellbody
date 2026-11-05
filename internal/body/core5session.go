@@ -237,14 +237,8 @@ func (s *Core5Session) handleExecutionRequest(ctx context.Context, data []byte) 
 
 		result := s.adapter.Handle(execCtx, &req)
 
-		resultData, err := json.Marshal(result)
-		if err != nil {
-			// Log error but don't block; connection may be closed
-			return
-		}
-
-		// Try to write result; ignore error if connection closed
-		_ = s.writeFrame(execCtx, resultData)
+		// Write result directly; writeFrame handles JSON marshaling
+		_ = s.writeFrame(execCtx, result)
 	}()
 
 	return nil
