@@ -21,6 +21,10 @@ import (
 // enrolled Ed25519 identity, advertises capabilities, and handles inbound
 // execution.request messages, replying with correlated execution.result
 // messages.
+//
+// M12.1d: Tracks in-flight executions and cancels them on transport
+// disconnect. The process executor is responsible for reaping child processes
+// when the context is cancelled. No automatic replay of interrupted executions.
 type Core5Session struct {
 	conn          *websocket.Conn
 	bodyID        string
@@ -29,7 +33,12 @@ type Core5Session struct {
 	corePublicKey ed25519.PublicKey
 	adapter       *execution.Core5Adapter
 
-	writeMu sync.Mutex
+	connMu sync.Mutex
+	closed bool
+
+	// M12.1d: in-flight execution tracking
+	inFlightMu   sync.Mutex
+	inFlightExec map[string]context.CancelFunc // keyed by execution ID
 }
 
 // DialCore5 connects to Core's /ws endpoint. Authentication is not started
@@ -49,6 +58,7 @@ func DialCore5(url string, creds Core5Credentials, adapter *execution.Core5Adapt
 		coreID:        creds.CoreID,
 		corePublicKey: creds.CorePublicKey,
 		adapter:       adapter,
+		inFlightExec:  make(map[string]context.CancelFunc),
 	}, nil
 }
 
@@ -146,6 +156,7 @@ func (s *Core5Session) AdvertiseCapabilities(ctx context.Context, caps []core5.C
 
 // Serve starts the message handling loop. Returns when the connection closes.
 func (s *Core5Session) Serve(ctx context.Context) error {
+	defer s.cancelInFlightExecutions()
 	for {
 		select {
 		case <-ctx.Done():
@@ -177,25 +188,88 @@ func (s *Core5Session) handleMessage(ctx context.Context, data []byte) error {
 	}
 }
 
+// handleExecutionRequest processes an execution.request from Core.
+// M12.1d: Creates a child context that will be cancelled on disconnect.
+// The execution is tracked so it can be cancelled if the transport drops.
+// If another execution is already in-flight, the new request is rejected.
+// Execution runs asynchronously so the Serve loop can detect transport disconnect.
 func (s *Core5Session) handleExecutionRequest(ctx context.Context, data []byte) error {
 	var req core5.ExecutionRequest
 	if err := json.Unmarshal(data, &req); err != nil {
 		return fmt.Errorf("unmarshal execution.request: %w", err)
 	}
 
-	result := s.adapter.Handle(ctx, &req)
-
-	resultData, err := json.Marshal(result)
-	if err != nil {
-		return fmt.Errorf("marshal execution.result: %w", err)
+	// M12.1d: Check for existing in-flight execution
+	s.inFlightMu.Lock()
+	if len(s.inFlightExec) > 0 {
+		s.inFlightMu.Unlock()
+		// Reject: another execution is in progress
+		result := &core5.ExecutionResult{
+			Type:          core5.TypeExecutionResult,
+			ID:            uuid.NewString(),
+			Timestamp:     time.Now().UTC(),
+			DollID:        req.DollID,
+			BodyID:        req.BodyID,
+			CorrelationID: req.ID,
+			Payload: core5.ExecutionResultPayload{
+				ExecutionID: req.Payload.ExecutionID,
+				Status:      core5.ExecutionStatusFailed,
+				Result: map[string]any{
+					"error": "another execution is already in progress",
+				},
+			},
+		}
+		return s.writeFrame(ctx, result)
 	}
 
-	return s.writeFrame(ctx, resultData)
+	// Create a cancellable context for this execution
+	execCtx, cancel := context.WithCancel(ctx)
+	s.inFlightExec[req.Payload.ExecutionID] = cancel
+	s.inFlightMu.Unlock()
+
+	// Execute asynchronously so Serve loop can continue and detect disconnect
+	go func() {
+		defer func() {
+			s.inFlightMu.Lock()
+			delete(s.inFlightExec, req.Payload.ExecutionID)
+			s.inFlightMu.Unlock()
+		}()
+
+		result := s.adapter.Handle(execCtx, &req)
+
+		resultData, err := json.Marshal(result)
+		if err != nil {
+			// Log error but don't block; connection may be closed
+			return
+		}
+
+		// Try to write result; ignore error if connection closed
+		_ = s.writeFrame(execCtx, resultData)
+	}()
+
+	return nil
+}
+
+// cancelInFlightExecutions cancels all in-flight execution contexts.
+// This is called when the transport disconnects (M12.1d).
+// The process executor will reap the child processes.
+func (s *Core5Session) cancelInFlightExecutions() {
+	s.inFlightMu.Lock()
+	defer s.inFlightMu.Unlock()
+
+	for _, cancel := range s.inFlightExec {
+		cancel()
+	}
+	s.inFlightExec = make(map[string]context.CancelFunc)
 }
 
 func (s *Core5Session) writeFrame(ctx context.Context, value any) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+
+	if s.closed || s.conn == nil {
+		return fmt.Errorf("connection closed")
+	}
 
 	data, err := json.Marshal(value)
 	if err != nil {
@@ -206,7 +280,15 @@ func (s *Core5Session) writeFrame(ctx context.Context, value any) error {
 }
 
 func (s *Core5Session) readFrame(ctx context.Context) ([]byte, error) {
-	_, data, err := s.conn.ReadMessage()
+	s.connMu.Lock()
+	conn := s.conn
+	s.connMu.Unlock()
+
+	if conn == nil {
+		return nil, fmt.Errorf("connection closed")
+	}
+
+	_, data, err := conn.ReadMessage()
 	if err != nil {
 		return nil, err
 	}
@@ -214,6 +296,21 @@ func (s *Core5Session) readFrame(ctx context.Context) ([]byte, error) {
 }
 
 // Close closes the session and underlying transport.
+// M12.1d: Cancels any in-flight executions before closing.
 func (s *Core5Session) Close() error {
-	return s.conn.Close()
+	s.connMu.Lock()
+	s.closed = true
+	conn := s.conn
+	s.connMu.Unlock()
+
+	s.inFlightMu.Lock()
+	for _, cancel := range s.inFlightExec {
+		cancel()
+	}
+	s.inFlightMu.Unlock()
+
+	if conn != nil {
+		return conn.Close()
+	}
+	return nil
 }

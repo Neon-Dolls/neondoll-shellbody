@@ -9,8 +9,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/Neon-Dolls/neondoll-shellbody/internal/execution/process"
 )
 
 // Shell Body's advertised capability contract. Core routes execution by
@@ -21,6 +19,11 @@ const (
 	CapabilityProcess = "process"
 	OperationRun      = "run"
 )
+
+// ExecutorInterface defines the interface for executing commands.
+type ExecutorInterface interface {
+	Execute(ctx context.Context, command string, args []string, env []string, dir string, stdin string, timeout time.Duration) (int, string, string, error)
+}
 
 func requiredString(v any) (string, string, bool) {
 	s, err := stringFrom(v)
@@ -105,7 +108,7 @@ const (
 
 // executeWithExecutor runs the process executor with proper context handling
 // and maps the result to exit code, stdout, stderr, and outcome classification.
-func executeWithExecutor(ctx context.Context, executor *process.Executor, command string, args []string, env []string, dir string, stdin string, timeout time.Duration) (int, string, string, ExecutionOutcome) {
+func executeWithExecutor(ctx context.Context, executor ExecutorInterface, command string, args []string, env []string, dir string, stdin string, timeout time.Duration) (int, string, string, ExecutionOutcome) {
 	exitCode, stdout, stderr, err := executor.Execute(ctx, command, args, env, dir, stdin, timeout)
 	switch {
 	case err == nil:

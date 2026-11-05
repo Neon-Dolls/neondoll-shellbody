@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Neon-Dolls/neondoll-shellbody/internal/execution/process"
 	"github.com/Neon-Dolls/neondoll-shellbody/internal/link/core5"
 	"github.com/google/uuid"
 )
@@ -15,12 +14,12 @@ import (
 // Core5Adapter maps canonical execution.request → process executor → canonical
 // execution.result.
 type Core5Adapter struct {
-	executor       *process.Executor
+	executor       ExecutorInterface
 	defaultTimeout time.Duration
 }
 
 // NewCore5 creates a Core5Adapter. defaultTimeout applies when a request omits one.
-func NewCore5(executor *process.Executor, defaultTimeout time.Duration) *Core5Adapter {
+func NewCore5(executor ExecutorInterface, defaultTimeout time.Duration) *Core5Adapter {
 	return &Core5Adapter{executor: executor, defaultTimeout: defaultTimeout}
 }
 
