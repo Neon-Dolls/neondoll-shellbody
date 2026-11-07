@@ -1021,7 +1021,7 @@ func TestCloseSessionAfterDisconnectVerifiesSessionID(t *testing.T) {
 	defer cancel()
 
 	deadline := time.Now().Add(10 * time.Second)
-	err := closeSessionAfterDisconnect(ctx, mismatchedDialer, "sess-ORIGINAL", 10*time.Millisecond, 50*time.Millisecond, deadline)
+	err := closeSessionAfterDisconnect(ctx, mismatchedDialer, "sess-ORIGINAL", 10*time.Millisecond, 50*time.Millisecond, deadline, NopReporter{})
 
 	// Must fail - mismatched session ID must close transport and fail closed
 	if err == nil {
@@ -1830,7 +1830,8 @@ func TestSelectSessionWithRetryRejectedSessionEmitsPermanentFailureOnce(t *testi
 
 // M11.3: Disconnected-EOF cleanup respects the same reporting rules.
 // closeSessionAfterDisconnect verifies session ID before OnResumed.
-func TestCloseSessionAfterDisconnectVerifiesSessionID(t *testing.T) {
+// This test verifies the structural pattern is present in code via code inspection.
+func TestCloseSessionAfterDisconnectVerifiesSessionID_CodeInspection(t *testing.T) {
 	t.Helper()
 	// closeSessionAfterDisconnect already has the correct pattern:
 	// it verifies resumed == sessionID before calling OnResumed.
