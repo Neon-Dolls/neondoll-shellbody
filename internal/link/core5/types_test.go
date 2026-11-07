@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
 
 func contains(t *testing.T, s, needle string) {
@@ -143,4 +144,87 @@ func TestInteractionShape(t *testing.T) {
 	contains(t, s, `"session_id":"sess-1"`)
 	contains(t, s, `"event":{"id":"evt-1","type":"message"`)
 	contains(t, s, `"payload":{"text":"hello"}`)
+}
+
+func TestExecutionStatusValid(t *testing.T) {
+	for _, ok := range []ExecutionStatus{
+		ExecutionStatusSuccess,
+		ExecutionStatusDenied,
+		ExecutionStatusUnsupported,
+		ExecutionStatusInvalid,
+		ExecutionStatusUnavailable,
+		ExecutionStatusFailed,
+		ExecutionStatusCancelled,
+		ExecutionStatusExpired,
+	} {
+		if !executionStatusValid(ok) {
+			t.Fatalf("expected %q to be valid", ok)
+		}
+	}
+	if executionStatusValid("bogus") {
+		t.Fatalf("bogus reported valid")
+	}
+}
+
+func TestExecutionRequestShape(t *testing.T) {
+	req := ExecutionRequest{
+		Type:      TypeExecutionRequest,
+		ID:        "req-exec-1",
+		Timestamp: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
+		DollID:    "doll-1",
+		BodyID:    "body-1",
+		Payload: ExecutionRequestPayload{
+			ExecutionID: "exec-1",
+			Capability:  "process",
+			Operation:   "run",
+			Arguments: map[string]any{
+				"command":   "echo",
+				"args":      []string{"hello"},
+				"timeout_s": 30.0,
+			},
+		},
+	}
+	b, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	s := string(b)
+	contains(t, s, `"type":"execution.request"`)
+	contains(t, s, `"id":"req-exec-1"`)
+	contains(t, s, `"doll_id":"doll-1"`)
+	contains(t, s, `"body_id":"body-1"`)
+	contains(t, s, `"execution_id":"exec-1"`)
+	contains(t, s, `"capability":"process"`)
+	contains(t, s, `"operation":"run"`)
+}
+
+func TestExecutionResultShape(t *testing.T) {
+	res := ExecutionResult{
+		Type:          TypeExecutionResult,
+		ID:            "res-exec-1",
+		Timestamp:     time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
+		DollID:        "doll-1",
+		BodyID:        "body-1",
+		CorrelationID: "req-exec-1",
+		Payload: ExecutionResultPayload{
+			ExecutionID: "exec-1",
+			Status:      ExecutionStatusSuccess,
+			Result: map[string]any{
+				"exit_code": float64(0),
+				"stdout":    "hello\n",
+				"stderr":    "",
+			},
+		},
+	}
+	b, err := json.Marshal(res)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	s := string(b)
+	contains(t, s, `"type":"execution.result"`)
+	contains(t, s, `"id":"res-exec-1"`)
+	contains(t, s, `"correlation_id":"req-exec-1"`)
+	contains(t, s, `"execution_id":"exec-1"`)
+	contains(t, s, `"status":"success"`)
+	contains(t, s, `"exit_code":0`)
 }

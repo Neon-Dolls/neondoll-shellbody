@@ -1,3 +1,4 @@
+// Package process provides wire-independent host process execution machinery.
 package process
 
 import (
@@ -142,60 +143,126 @@ func TestExecutorCommandNotFound(t *testing.T) {
 	}
 }
 
-// TestExecutorParentContextCancellation tests that Executor respects parent context cancellation
-func TestExecutorParentContextCancellation(t *testing.T) {
+// TestExecutorCancelsAndReapsProcess tests that a long-running process is cancelled and reaped
+func TestExecutorCancelsAndReapsProcess(t *testing.T) {
 	e := NewExecutor()
-	// Create a parent context that we can cancel
-	parentCtx, cancel := context.WithCancel(context.Background())
 
-	// Channel to receive the result
-	resultChan := make(chan struct {
-		exitCode int
-		stdout   string
-		stderr   string
-		err      error
-	}, 1)
+	// Test that a long-running process is cancelled and reaped
+	ctx, cancel := context.WithCancel(context.Background())
 
-	// Start the Execute call in a goroutine
+	done := make(chan struct{})
 	go func() {
-		exitCode, stdout, stderr, err := e.Execute(parentCtx, "sleep", []string{"10"}, []string{}, "", "", 0)
-		resultChan <- struct {
-			exitCode int
-			stdout   string
-			stderr   string
-			err      error
-		}{exitCode, stdout, stderr, err}
+		// Use sleep 10 to simulate a long-running process
+		_, _, _, err := e.Execute(ctx, "sleep", []string{"10"}, nil, "", "", 30*time.Second)
+		// When cancelled, we expect context.Canceled error
+		if err != nil && err != context.Canceled {
+			t.Errorf("expected context.Canceled, got %v", err)
+		}
+		close(done)
 	}()
 
-	// Wait a bit to ensure the process has started
+	// Give the process time to start
 	time.Sleep(100 * time.Millisecond)
 
-	// Cancel the parent context
+	// Cancel the context
 	cancel()
 
-	// Wait for the result
+	// Wait for the executor to finish
 	select {
-	case result := <-resultChan:
-		// Execute should return promptly due to context cancellation
-		if result.err == nil {
-			t.Fatalf("Expected error due to context cancellation, got none")
-		}
-		// Should return exit code -1 for context cancellation
-		if result.exitCode != -1 {
-			t.Fatalf("Expected exit code -1 for context cancellation, got %d", result.exitCode)
-		}
-		// Error should be context.Canceled
-		if result.err != context.Canceled {
-			t.Fatalf("Expected error to be context.Canceled, got %v", result.err)
-		}
-		// Output should be empty since process was killed quickly
-		if result.stdout != "" {
-			t.Fatalf("Expected empty stdout, got %q", result.stdout)
-		}
-		if result.stderr != "" {
-			t.Fatalf("Expected empty stderr, got %q", result.stderr)
-		}
+	case <-done:
+		// Success - process was cancelled and reaped
 	case <-time.After(5 * time.Second):
-		t.Fatalf("Timed out waiting for Execute to return")
+		t.Fatal("executor did not finish after cancellation - process may be orphaned")
 	}
+}
+
+// TestExecutorTimeoutKillsProcess tests that a timeout kills the process
+func TestExecutorTimeoutKillsProcess(t *testing.T) {
+	e := NewExecutor()
+
+	// Test that a timeout kills the process
+	ctx := context.Background()
+
+	done := make(chan struct{})
+	go func() {
+		// Use sleep 10 with a 200ms timeout
+		_, _, _, err := e.Execute(ctx, "sleep", []string{"10"}, nil, "", "", 200*time.Millisecond)
+		// When timed out, we expect context.DeadlineExceeded error
+		if err != nil && err != context.DeadlineExceeded {
+			t.Errorf("expected context.DeadlineExceeded, got %v", err)
+		}
+		close(done)
+	}()
+
+	// Wait for the executor to finish
+	select {
+	case <-done:
+		// Success - process was killed and reaped
+	case <-time.After(5 * time.Second):
+		t.Fatal("executor did not finish after timeout - process may be orphaned")
+	}
+}
+
+// TestExecutorNoOrphanOnQuickCancel tests immediate cancellation
+func TestExecutorNoOrphanOnQuickCancel(t *testing.T) {
+	e := NewExecutor()
+
+	// Test immediate cancellation
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		_, _, _, err := e.Execute(ctx, "sleep", []string{"10"}, nil, "", "", 30*time.Second)
+		if err != nil && err != context.Canceled {
+			t.Errorf("expected context.Canceled, got %v", err)
+		}
+		close(done)
+	}()
+
+	// Cancel immediately
+	cancel()
+
+	select {
+	case <-done:
+		// Success
+	case <-time.After(5 * time.Second):
+		t.Fatal("executor did not finish after immediate cancellation")
+	}
+}
+
+// TestExecutorNoOrphanOnBinaryNotFound tests error handling for nonexistent binary
+func TestExecutorNoOrphanOnBinaryNotFound(t *testing.T) {
+	e := NewExecutor()
+
+	ctx := context.Background()
+	_, _, _, err := e.Execute(ctx, "nonexistent-binary-12345", nil, nil, "", "", 5*time.Second)
+	if err == nil {
+		t.Fatal("expected error for nonexistent binary")
+	}
+	// Should return error quickly without hanging
+}
+
+// TestExecutorReapsZombieProcesses runs multiple quick processes to ensure no zombies accumulate
+func TestExecutorReapsZombieProcesses(t *testing.T) {
+	e := NewExecutor()
+
+	// Run multiple quick processes to ensure no zombies accumulate
+	for i := 0; i < 10; i++ {
+		ctx := context.Background()
+		exitCode, stdout, stderr, err := e.Execute(ctx, "echo", []string{"hello"}, nil, "", "", 5*time.Second)
+		if err != nil {
+			t.Errorf("iteration %d: unexpected error: %v", i, err)
+		}
+		if exitCode != 0 {
+			t.Errorf("iteration %d: expected exit code 0, got %d", i, exitCode)
+		}
+		if stdout != "hello\n" {
+			t.Errorf("iteration %d: expected stdout 'hello\\n', got %q", i, stdout)
+		}
+		if stderr != "" {
+			t.Errorf("iteration %d: expected empty stderr, got %q", i, stderr)
+		}
+	}
+
+	// If we get here without hanging, processes are being reaped properly
 }

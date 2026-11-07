@@ -222,7 +222,7 @@ func TestCore4SessionRoundTrip(t *testing.T) {
 		t.Fatalf("expected authenticated, got %q", accept.Status)
 	}
 
-	if err := sess.AdvertiseCapabilities(ctx, execution.Advertised()); err != nil {
+	if err := sess.AdvertiseCapabilities(ctx, execution.AdvertisedCore4()); err != nil {
 		t.Fatalf("advertise: %v", err)
 	}
 
@@ -358,7 +358,7 @@ func mustDialAuthenticated(t *testing.T, wsURL string) *Core4Session {
 		sess.Close()
 		t.Fatalf("authenticate: %v", err)
 	}
-	if err := sess.AdvertiseCapabilities(ctx, execution.Advertised()); err != nil {
+	if err := sess.AdvertiseCapabilities(ctx, execution.AdvertisedCore4()); err != nil {
 		sess.Close()
 		t.Fatalf("advertise: %v", err)
 	}
